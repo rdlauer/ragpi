@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     # Operator-authorized `ALTER EXTENSION vector UPDATE` at preflight (affects the
     # whole database). Off by default; preflight fails with guidance instead.
     PG_UPDATE_VECTOR_EXTENSION: bool = False
+    # Retrieval tuning for the >2000-dim two-stage path: fetch top_k * multiplier
+    # candidates via the half-precision ANN index, then rerank by exact float32
+    # cosine. HNSW_EF_SEARCH pins hnsw.ef_search (None => derived from candidate count).
+    EMBEDDING_CANDIDATE_MULTIPLIER: int = 10
+    HNSW_EF_SEARCH: int | None = None
 
     # GitHub
     GITHUB_TOKEN: str | None = None
@@ -108,6 +113,10 @@ class Settings(BaseSettings):
                 "EMBEDDING_DIMENSIONS > 4000 cannot be indexed by pgvector "
                 "(halfvec ivfflat/hnsw max is 4000)."
             )
+        if self.EMBEDDING_CANDIDATE_MULTIPLIER < 1:
+            raise ValueError("EMBEDDING_CANDIDATE_MULTIPLIER must be >= 1")
+        if self.HNSW_EF_SEARCH is not None and self.HNSW_EF_SEARCH < 1:
+            raise ValueError("HNSW_EF_SEARCH must be >= 1")
         _openai_embedding_max = {
             "text-embedding-3-small": 1536,
             "text-embedding-3-large": 3072,
