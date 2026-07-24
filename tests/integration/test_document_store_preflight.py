@@ -196,3 +196,83 @@ def test_halfvec_hnsw_expression_index_builds_on_3072(pg_url: str) -> None:
     assert "hnsw" in defs
     assert "halfvec" in defs
     assert "big_vec_embedding_halfvec_idx" in defs
+
+
+# --------------------------------------------------------------------------- #
+# Physical drift after manifest creation (manifest != proof objects still exist)
+# --------------------------------------------------------------------------- #
+def _exec(url: str, *statements: str) -> None:
+    engine = create_engine(url)
+    try:
+        with engine.begin() as conn:
+            for stmt in statements:
+                conn.execute(text(stmt))
+    finally:
+        engine.dispose()
+
+
+def test_compatible_manifest_but_missing_table_fails(pg_url: str) -> None:
+    settings = _settings(pg_url)
+    run_preflight(settings)
+    _exec(pg_url, f'DROP TABLE "{NS}" CASCADE')  # manifest row remains
+    with pytest.raises(PreflightError, match="table is missing"):
+        run_preflight(settings)
+
+
+def test_compatible_manifest_but_missing_vector_index_fails(pg_url: str) -> None:
+    settings = _settings(pg_url)
+    run_preflight(settings)
+    _exec(pg_url, f'DROP INDEX "{NS}_embedding_idx"')
+    with pytest.raises(PreflightError, match="no vector index"):
+        run_preflight(settings)
+
+
+def test_compatible_manifest_but_missing_column_fails(pg_url: str) -> None:
+    settings = _settings(pg_url)
+    run_preflight(settings)
+    _exec(pg_url, f'ALTER TABLE "{NS}" DROP COLUMN url')  # not part of fts_vector expr
+    with pytest.raises(PreflightError, match="missing required column"):
+        run_preflight(settings)
+
+
+def test_legacy_adoption_requires_a_vector_index(pg_url: str) -> None:
+    settings = _settings(pg_url)
+    run_preflight(settings)
+    # Simulate a legacy store with the vector index missing and no manifest.
+    _exec(pg_url, f"DROP TABLE {MANIFEST_TABLE}", f'DROP INDEX "{NS}_embedding_idx"')
+    with pytest.raises(PreflightError, match="no vector index"):
+        run_preflight(settings)
+
+
+def test_legacy_adoption_rejects_wrong_opclass(pg_url: str) -> None:
+    settings = _settings(pg_url)
+    run_preflight(settings)
+    # Legacy store whose vector index uses the wrong (l2) opclass, no manifest.
+    _exec(
+        pg_url,
+        f"DROP TABLE {MANIFEST_TABLE}",
+        f'DROP INDEX "{NS}_embedding_idx"',
+        f'CREATE INDEX "{NS}_embedding_idx" ON "{NS}" '
+        "USING ivfflat (embedding vector_l2_ops) WITH (lists = 100)",
+    )
+    with pytest.raises(PreflightError, match="does not match the configured"):
+        run_preflight(settings)
+
+
+def test_adopted_legacy_index_name_recorded_and_survives_restart(pg_url: str) -> None:
+    settings = _settings(pg_url)
+    run_preflight(settings)
+    # Simulate a pre-manifest deployment with the historical (non-namespaced) index name.
+    _exec(
+        pg_url,
+        f'ALTER INDEX "{NS}_embedding_idx" RENAME TO embedding_idx',
+        f"DROP TABLE {MANIFEST_TABLE}",
+    )
+
+    run_preflight(settings)  # adopts, records the legacy physical index name
+    manifest = _read_manifest(pg_url)
+    assert manifest is not None
+    assert manifest.index_schema.name == "embedding_idx"
+
+    run_preflight(settings)  # restart: compatible manifest + physical validation passes
+    assert _read_manifest(pg_url).index_schema.name == "embedding_idx"  # type: ignore[union-attr]

@@ -17,6 +17,7 @@ in a following slice; until then the Redis store keeps its existing self-init.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -266,29 +267,32 @@ def _ensure_extension_version(conn, settings: Settings, dims: int) -> None:
         )
 
 
-def _create_indexes(conn, namespace: str, dims: int) -> None:
+def _create_indexes(conn, namespace: str, dims: int) -> str:
+    """Create the FTS GIN index and the dimension-appropriate vector index with
+    namespace-aware names. Returns the physical vector-index name."""
     qns = _quote(namespace)
     fts_idx = _quote(_index_name(namespace, "fts_vector_idx"))
     conn.execute(
         text(f"CREATE INDEX IF NOT EXISTS {fts_idx} ON {qns} USING gin (fts_vector)")
     )
     if dims > 2000:
-        emb_idx = _quote(_index_name(namespace, "embedding_halfvec_idx"))
+        emb_idx_name = _index_name(namespace, "embedding_halfvec_idx")
         conn.execute(
             text(
-                f"CREATE INDEX IF NOT EXISTS {emb_idx} ON {qns} "
+                f"CREATE INDEX IF NOT EXISTS {_quote(emb_idx_name)} ON {qns} "
                 f"USING hnsw ((embedding::halfvec({dims})) halfvec_cosine_ops) "
                 "WITH (m = 16, ef_construction = 64)"
             )
         )
     else:
-        emb_idx = _quote(_index_name(namespace, "embedding_idx"))
+        emb_idx_name = _index_name(namespace, "embedding_idx")
         conn.execute(
             text(
-                f"CREATE INDEX IF NOT EXISTS {emb_idx} ON {qns} "
+                f"CREATE INDEX IF NOT EXISTS {_quote(emb_idx_name)} ON {qns} "
                 "USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)"
             )
         )
+    return emb_idx_name
 
 
 def _table_exists(conn, namespace: str) -> bool:
@@ -299,35 +303,150 @@ def _table_exists(conn, namespace: str) -> bool:
     )
 
 
-def _adopt_legacy(conn, settings: Settings, configured: StoreManifest, namespace: str) -> None:
-    fmt = conn.execute(
+# Columns the document-store table must physically have (mirrors the ORM model).
+_REQUIRED_COLUMNS = {
+    "id",
+    "source",
+    "title",
+    "content",
+    "url",
+    "created_at",
+    "embedding",
+    "fts_vector",
+}
+
+
+def _table_columns(conn, namespace: str) -> dict[str, str]:
+    rows = conn.execute(
         text(
-            "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
-            "WHERE a.attrelid = to_regclass(:q) AND a.attname = 'embedding' "
-            "AND a.attnum > 0 AND NOT a.attisdropped"
+            "SELECT a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
+            "WHERE a.attrelid = to_regclass(:q) AND a.attnum > 0 AND NOT a.attisdropped"
         ),
         {"q": namespace},
-    ).scalar()
-    if fmt is None:
+    ).fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
+def _table_indexes(conn, namespace: str) -> list[tuple[str, str]]:
+    """(index name, indexdef) for every index on the table, resolved by the table's
+    oid so it is schema-accurate."""
+    rows = conn.execute(
+        text(
+            "SELECT c.relname, pg_get_indexdef(i.indexrelid) FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indexrelid WHERE i.indrelid = to_regclass(:q)"
+        ),
+        {"q": namespace},
+    ).fetchall()
+    return [(row[0], row[1]) for row in rows]
+
+
+def _find_vector_index(indexes: list[tuple[str, str]]) -> tuple[str, str] | None:
+    for name, indexdef in indexes:
+        low = indexdef.lower()
+        if "using ivfflat" in low or "using hnsw" in low:
+            return name, indexdef
+    return None
+
+
+def _vector_index_matches(indexdef: str, index_schema: IndexSchema) -> bool:
+    low = indexdef.lower()
+    if f"using {index_schema.algorithm}" not in low:
+        return False
+    if index_schema.opclass not in low:
+        return False
+    if index_schema.expression:
+        # e.g. "embedding::halfvec(3072)" -> require the halfvec(dims) cast.
+        cast = index_schema.expression.split("::", 1)[-1].strip().lower()
+        return cast in low
+    # Plain-column index must not be a half-precision cast index.
+    return "halfvec" not in low
+
+
+def _has_fts_index(indexes: list[tuple[str, str]]) -> bool:
+    return any(
+        "using gin" in indexdef.lower() and "fts_vector" in indexdef.lower()
+        for _, indexdef in indexes
+    )
+
+
+def _validate_physical_store(
+    conn, settings: Settings, configured: StoreManifest, namespace: str
+) -> str:
+    """Introspect the actual table + indexes and confirm they match `configured`.
+    The manifest records intended configuration, not proof the objects still exist, so
+    this runs on both the manifest-present (restart) and legacy-adoption paths. Raises
+    PreflightError with specific guidance on any drift; returns the vector index name.
+    Structural failures here are NOT overridable by EMBEDDING_ADOPT_EXISTING."""
+    if not _table_exists(conn, namespace):
         raise PreflightError(
-            f"Existing table '{namespace}' has no 'embedding' column; cannot adopt it as a "
-            "Ragpi document store."
+            f"Document store '{namespace}' has a manifest but its table is missing. The store "
+            "appears to have been dropped — delete the manifest row and restart to recreate it, "
+            "then re-embed all sources."
         )
-    col_type, col_dims = _parse_column_type(fmt)
+
+    columns = _table_columns(conn, namespace)
+    missing = sorted(_REQUIRED_COLUMNS - set(columns))
+    if missing:
+        raise PreflightError(
+            f"Document store '{namespace}' is missing required column(s) {missing}; it is not a "
+            "valid Ragpi store. Recreate it and re-embed all sources."
+        )
+
+    col_type, col_dims = _parse_column_type(columns["embedding"])
     if (
         col_type != configured.storage_schema.column_type
         or col_dims != configured.storage_schema.dimensions
     ):
         raise PreflightError(
-            f"Existing '{namespace}.embedding' column is '{fmt}', but the configuration expects "
-            f"{configured.storage_schema.column_type}({configured.storage_schema.dimensions}) "
+            f"Existing '{namespace}.embedding' column is '{columns['embedding']}', but the "
+            f"configuration expects {configured.storage_schema.column_type}"
+            f"({configured.storage_schema.dimensions}) "
             f"(EMBEDDING_MODEL={settings.EMBEDDING_MODEL}, "
             f"EMBEDDING_DIMENSIONS={settings.EMBEDDING_DIMENSIONS}). Changing embedding "
             "dimensions/type requires recreating the store and re-embedding all sources."
         )
+
+    indexes = _table_indexes(conn, namespace)
+    vector_index = _find_vector_index(indexes)
+    if vector_index is None:
+        raise PreflightError(
+            f"Document store '{namespace}' has no vector index on 'embedding'. Rebuild the "
+            f"{configured.index_schema.algorithm}/{configured.index_schema.opclass} index."
+        )
+    index_name, indexdef = vector_index
+    if not _vector_index_matches(indexdef, configured.index_schema):
+        raise PreflightError(
+            f"Document store '{namespace}' vector index '{index_name}' does not match the "
+            f"configured {configured.index_schema.algorithm}/{configured.index_schema.opclass} "
+            f"definition (found: {indexdef}). Rebuild the vector index."
+        )
+    if not _has_fts_index(indexes):
+        raise PreflightError(
+            f"Document store '{namespace}' is missing the full-text GIN index on 'fts_vector'. "
+            "Rebuild it."
+        )
+    return index_name
+
+
+def _with_index_name(manifest: StoreManifest, name: str) -> StoreManifest:
+    return dataclasses.replace(
+        manifest, index_schema=dataclasses.replace(manifest.index_schema, name=name)
+    )
+
+
+def _adopt_legacy(conn, settings: Settings, configured: StoreManifest, namespace: str) -> None:
+    # Full structural validation first — columns, embedding type/dims, vector index
+    # definition, and FTS index. A structural mismatch is NOT overridable.
+    index_name = _validate_physical_store(conn, settings, configured, namespace)
+    # Only the embedding *identity* (provider/model) is unknowable from the database;
+    # that is what EMBEDDING_ADOPT_EXISTING may override, not structural incompatibility.
     if _is_legacy_default(configured) or settings.EMBEDDING_ADOPT_EXISTING:
-        _write_manifest(conn, namespace, configured)
-        logger.info("Adopted existing document store '%s' and wrote its manifest.", namespace)
+        _write_manifest(conn, namespace, _with_index_name(configured, index_name))
+        logger.info(
+            "Adopted existing document store '%s' (vector index '%s') and wrote its manifest.",
+            namespace,
+            index_name,
+        )
     else:
         raise PreflightError(
             f"Existing document store '{namespace}' has no manifest, and the configured embedding "
@@ -344,10 +463,13 @@ def _create_fresh(conn, configured: StoreManifest, namespace: str, dims: int) ->
     from src.document_store.postgres.model import Base
 
     Base.metadata.create_all(conn)  # table only; indexes are created below (namespace-aware)
-    _create_indexes(conn, namespace, dims)
-    _write_manifest(conn, namespace, configured)
+    index_name = _create_indexes(conn, namespace, dims)
+    _write_manifest(conn, namespace, _with_index_name(configured, index_name))
     logger.info(
-        "Created fresh document store '%s' (dims=%d) and wrote its manifest.", namespace, dims
+        "Created fresh document store '%s' (dims=%d, vector index '%s') and wrote its manifest.",
+        namespace,
+        dims,
+        index_name,
     )
 
 
@@ -367,7 +489,10 @@ def _pg_preflight(engine: Engine, settings: Settings) -> None:
             comparison = compare_manifests(configured, existing)
             if not comparison.compatible:
                 raise PreflightError(comparison.message)
-            logger.info("Document store '%s' is compatible with its manifest.", namespace)
+            # The manifest records intended configuration, not proof the objects still
+            # exist — confirm the physical table/columns/indexes match before trusting it.
+            _validate_physical_store(conn, settings, configured, namespace)
+            logger.info("Document store '%s' is compatible and physically valid.", namespace)
             return
 
         if _table_exists(conn, namespace):

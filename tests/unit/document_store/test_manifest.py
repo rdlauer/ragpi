@@ -91,6 +91,22 @@ class TestCompareManifests:
         assert result.remediation is Remediation.UNSUPPORTED_VERSION
         assert result.compatible is False
 
+    def test_older_existing_version_is_unsupported(self):
+        # Fail closed on ANY version mismatch — an older manifest must not be
+        # reinterpreted through today's field semantics without a migration handler.
+        configured = _manifest(version=MANIFEST_VERSION)
+        existing = _manifest(version=MANIFEST_VERSION - 1)
+        result = compare_manifests(configured, existing)
+        assert result.remediation is Remediation.UNSUPPORTED_VERSION
+        assert result.compatible is False
+
+    def test_physical_index_name_excluded_from_compatibility(self):
+        from src.document_store.manifest import IndexSchema
+
+        a = IndexSchema("ivfflat", "vector_cosine_ops", None, {"lists": 100}, name="a_idx")
+        b = IndexSchema("ivfflat", "vector_cosine_ops", None, {"lists": 100}, name="b_idx")
+        assert a == b  # name is administrative metadata, not a compatibility criterion
+
     def test_model_change_requires_reembed(self):
         result = compare_manifests(
             _manifest(model="text-embedding-3-large", dimensions=1536),

@@ -93,6 +93,9 @@ class IndexSchema:
     opclass: str  # "vector_cosine_ops" | "halfvec_cosine_ops"
     expression: str | None  # e.g. "embedding::halfvec(3072)"; None = plain column index
     build_params: dict[str, Any] = field(default_factory=dict)  # {"lists":100} | {"m":16,"ef_construction":64}
+    # Physical index name (namespace-derived for fresh stores, legacy name for adopted
+    # ones). Administrative metadata only — excluded from compatibility equality.
+    name: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -121,6 +124,7 @@ class StoreManifest:
                 "opclass": self.index_schema.opclass,
                 "expression": self.index_schema.expression,
                 "build_params": dict(self.index_schema.build_params),
+                "name": self.index_schema.name,
             },
         }
 
@@ -147,6 +151,7 @@ class StoreManifest:
                 opclass=ix["opclass"],
                 expression=ix.get("expression"),
                 build_params=dict(ix.get("build_params") or {}),
+                name=ix.get("name"),
             ),
         )
 
@@ -168,17 +173,17 @@ def compare_manifests(
     least-destructive remediation required. Order matters: check the format
     version first, then most-destructive (re-embed) before least (rebuild index).
     """
-    # 1. Format version. An unknown *newer* manifest must never be overwritten.
-    if existing.manifest_version > configured.manifest_version:
+    # 1. Format version. Fail closed on ANY version mismatch — a newer manifest must
+    # never be overwritten, and an older one must not be reinterpreted through today's
+    # field semantics without an explicit migration handler (none exists yet).
+    if existing.manifest_version != configured.manifest_version:
         return ManifestComparison(
             Remediation.UNSUPPORTED_VERSION,
-            f"Existing store manifest version {existing.manifest_version} is newer than "
-            f"this build understands ({configured.manifest_version}). Refusing to start to "
-            "avoid corrupting a store written by a newer Ragpi. Upgrade Ragpi or restore a "
-            "compatible store.",
+            f"Existing store manifest version {existing.manifest_version} is not supported by "
+            f"this build (expected {configured.manifest_version}) and no migration handler is "
+            "registered. Refusing to start to avoid misreading a store written by a different "
+            "Ragpi version.",
         )
-    # (An older known version would be format-migrated in place under the startup
-    # lock; there is no older version yet, so nothing to do for MANIFEST_VERSION == 1.)
 
     # 2. Embedding identity — the stored vectors live in a different space.
     if configured.embedding_identity != existing.embedding_identity:
