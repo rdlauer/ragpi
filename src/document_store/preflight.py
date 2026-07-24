@@ -49,11 +49,24 @@ MIN_PGVECTOR_FOR_LARGE = (0, 8, 0)
 MANIFEST_TABLE = "ragpi_store_manifest"
 PREFLIGHT_LOCK_TIMEOUT_S = 30.0
 REDIS_LOCK_TTL_S = 60
+# Acquisition timeout must exceed the TTL so a process can outwait a lock abandoned by
+# a crashed initializer (rather than failing before the stale lock expires).
+REDIS_LOCK_ACQUIRE_TIMEOUT_S = REDIS_LOCK_TTL_S + 15
 # Only delete a lock we still own (guards against deleting a replacement's lock).
 _REDIS_UNLOCK_LUA = (
     "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) "
     "else return 0 end"
 )
+# Fields the Redis index must physically have (mirrors redis/fields.py).
+_REDIS_REQUIRED_FIELDS = {
+    "id",
+    "source",
+    "content",
+    "url",
+    "created_at",
+    "title",
+    "embedding",
+}
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _COLTYPE_RE = re.compile(r"^([A-Za-z_]+)\s*(?:\((\d+)\))?$")
@@ -505,12 +518,19 @@ def _pg_preflight(engine: Engine, settings: Settings) -> None:
 # Redis preflight                                                             #
 # --------------------------------------------------------------------------- #
 @contextmanager
-def _redis_lock(client: Any, key: str) -> Iterator[str]:
+def _redis_lock(
+    client: Any,
+    key: str,
+    *,
+    ttl: int = REDIS_LOCK_TTL_S,
+    acquire_timeout: float = REDIS_LOCK_ACQUIRE_TIMEOUT_S,
+) -> Iterator[str]:
     """Short-lived distributed lock: SET NX EX with a unique token, released via a
-    compare-and-delete Lua script so we never delete a replacement process's lock."""
+    compare-and-delete Lua script so we never delete a replacement process's lock. The
+    acquisition timeout exceeds the TTL so a process can outwait an abandoned lock."""
     token = secrets.token_hex(16)
-    deadline = time.monotonic() + PREFLIGHT_LOCK_TIMEOUT_S
-    while not client.set(key, token, nx=True, ex=REDIS_LOCK_TTL_S):
+    deadline = time.monotonic() + acquire_timeout
+    while not client.set(key, token, nx=True, ex=ttl):
         if time.monotonic() >= deadline:
             raise PreflightError(
                 f"Timed out acquiring the Redis document-store startup lock ({key}); "
@@ -526,36 +546,90 @@ def _redis_lock(client: Any, key: str) -> Iterator[str]:
             logger.warning("Failed to release Redis preflight lock %s", key)
 
 
+def _assert_lock_owned(client: Any, key: str, token: str) -> None:
+    """Fail if we no longer hold the startup lock (it expired and a replacement took
+    over), so a stale initializer never keeps mutating shared state after losing it."""
+    if client.get(key) != token:
+        raise PreflightError(
+            "Lost the Redis document-store startup lock mid-initialization (it expired and "
+            "another process took over). Aborting to avoid concurrent initialization — restart "
+            "this process to retry."
+        )
+
+
 def _canon(value: Any) -> str:
     return str(getattr(value, "value", value)).lower()
 
 
-def _adopt_legacy_redis(
-    client: Any, settings: Settings, configured: StoreManifest, name: str
-) -> None:
+def _validate_redis_index(client: Any, configured: StoreManifest, name: str) -> None:
+    """Confirm the actual server-side index matches `configured`: existence, HASH
+    storage, key prefix, required fields, and the embedding vector schema. A manifest or
+    crash marker is not proof the index still exists or matches, so this runs on the
+    manifest, crash-resume, and legacy-adoption paths. Structural mismatches here are
+    NOT overridable by EMBEDDING_ADOPT_EXISTING."""
     from redisvl.index import SearchIndex  # type: ignore
 
-    existing = SearchIndex.from_existing(name, redis_client=client)
-    attrs = existing.schema.fields["embedding"].attrs
-    existing_dims = int(getattr(attrs, "dims"))
-    if existing_dims != configured.storage_schema.dimensions:
+    from src.document_store.redis.store import build_index_schema
+
+    dims = configured.storage_schema.dimensions
+    if not SearchIndex(build_index_schema(name, dims), redis_client=client).exists():
         raise PreflightError(
-            f"Existing Redis index '{name}' has embedding dims {existing_dims}, but the "
-            f"configuration expects {configured.storage_schema.dimensions} "
-            f"(EMBEDDING_MODEL={settings.EMBEDDING_MODEL}). Changing embedding dimensions "
-            "requires dropping the index and its keys and re-embedding all sources."
+            f"Redis index '{name}' is expected (manifest/marker present) but missing on the "
+            "server. Recreate the index and re-embed all sources."
         )
-    existing_schema = (
+    existing = SearchIndex.from_existing(name, redis_client=client)
+    info = existing.schema.index
+
+    storage = _canon(getattr(info, "storage_type", "hash"))
+    if storage != "hash":
+        raise PreflightError(
+            f"Redis index '{name}' uses '{storage}' storage but Ragpi requires HASH. Recreate "
+            "the index and re-embed."
+        )
+
+    expected_prefix = f"{name}:sources"
+    prefixes = info.prefix if isinstance(info.prefix, list) else [info.prefix]
+    if expected_prefix not in prefixes:
+        raise PreflightError(
+            f"Redis index '{name}' key prefix {prefixes} does not include the expected "
+            f"'{expected_prefix}'. Recreate the index and re-embed."
+        )
+
+    fields = existing.schema.fields
+    missing = sorted(_REDIS_REQUIRED_FIELDS - set(fields))
+    if missing:
+        raise PreflightError(
+            f"Redis index '{name}' is missing required field(s) {missing}. Recreate the index "
+            "and re-embed."
+        )
+
+    attrs = fields["embedding"].attrs
+    existing_dims = int(getattr(attrs, "dims"))
+    if existing_dims != dims:
+        raise PreflightError(
+            f"Redis index '{name}' embedding dims {existing_dims} != configured {dims}. Drop the "
+            "index and its keys and re-embed."
+        )
+    schema = (
         _canon(getattr(attrs, "datatype", "float32")),
         _canon(getattr(attrs, "distance_metric", "cosine")),
         _canon(getattr(attrs, "algorithm", "hnsw")),
     )
-    if existing_schema != ("float32", "cosine", "hnsw"):
+    if schema != ("float32", "cosine", "hnsw"):
         raise PreflightError(
-            f"Existing Redis index '{name}' vector schema {existing_schema} is incompatible "
-            "with the configured float32/cosine/hnsw; drop the index and its keys and re-embed."
+            f"Redis index '{name}' vector schema {schema} is incompatible with float32/cosine/"
+            "hnsw. Drop the index and its keys and re-embed."
         )
+
+
+def _adopt_legacy_redis(
+    client: Any, settings: Settings, configured: StoreManifest, name: str, token: str
+) -> None:
+    # Full structural validation first (not overridable by EMBEDDING_ADOPT_EXISTING).
+    _validate_redis_index(client, configured, name)
+    # Only the embedding *identity* (provider/model) is unverifiable from the index.
     if _is_legacy_default(configured) or settings.EMBEDDING_ADOPT_EXISTING:
+        _assert_lock_owned(client, f"{name}:__preflight_lock__", token)
         client.set(f"{name}:__manifest__", json.dumps(configured.to_dict()))
         logger.info("Adopted existing Redis document store '%s' and wrote its manifest.", name)
     else:
@@ -582,7 +656,7 @@ def _redis_preflight(client: Any, settings: Settings) -> None:
     lock_key = f"{name}:__preflight_lock__"
     fingerprint = _fingerprint(configured)
 
-    with _redis_lock(client, lock_key):
+    with _redis_lock(client, lock_key) as token:
         index = SearchIndex(build_index_schema(name, dims), redis_client=client)
 
         existing_raw = client.get(manifest_key)
@@ -592,16 +666,21 @@ def _redis_preflight(client: Any, settings: Settings) -> None:
             )
             if not comparison.compatible:
                 raise PreflightError(comparison.message)
+            # A manifest is not proof the index still exists or matches.
+            _validate_redis_index(client, configured, name)
+            _assert_lock_owned(client, lock_key, token)
             client.delete(marker_key)  # clear any stale init marker
-            logger.info("Redis document store '%s' is compatible with its manifest.", name)
+            logger.info("Redis document store '%s' is compatible and physically valid.", name)
             return
 
         if index.exists():
             marker_raw = client.get(marker_key)
             if marker_raw:
                 if json.loads(marker_raw).get("fingerprint") == fingerprint:
-                    # Interrupted init for THIS config (index created, manifest not
-                    # written): safe to resume.
+                    # Interrupted init for THIS config — validate the actual index before
+                    # certifying it (a stale marker must not bless an incompatible index).
+                    _validate_redis_index(client, configured, name)
+                    _assert_lock_owned(client, lock_key, token)
                     client.set(manifest_key, json.dumps(configured.to_dict()))
                     client.delete(marker_key)
                     logger.info("Resumed interrupted Redis index init for '%s'.", name)
@@ -610,13 +689,19 @@ def _redis_preflight(client: Any, settings: Settings) -> None:
                     f"Redis index '{name}' carries an initialization marker for a different "
                     "configuration (an interrupted init). Drop the index and its keys, then re-embed."
                 )
-            _adopt_legacy_redis(client, settings, configured, name)
+            _adopt_legacy_redis(client, settings, configured, name, token)
             return
 
         # Fresh: init-marker protocol makes a crash between create and manifest-write
-        # recoverable (and an unmarked index is never silently adopted).
-        client.set(marker_key, json.dumps({"fingerprint": fingerprint}))
+        # recoverable (and an unmarked index is never silently adopted). Re-check lock
+        # ownership before each mutation so a stale owner that lost the lock stops writing.
+        _assert_lock_owned(client, lock_key, token)
+        client.set(
+            marker_key,
+            json.dumps({"fingerprint": fingerprint, "token": token, "phase": "pending_manifest"}),
+        )
         index.create()
+        _assert_lock_owned(client, lock_key, token)
         client.set(manifest_key, json.dumps(configured.to_dict()))
         client.delete(marker_key)
         logger.info("Created fresh Redis document store '%s' and wrote its manifest.", name)

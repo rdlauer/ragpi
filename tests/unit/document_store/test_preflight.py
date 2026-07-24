@@ -2,10 +2,13 @@ import pytest
 
 from src.config import Settings
 from src.document_store.preflight import (
+    REDIS_LOCK_ACQUIRE_TIMEOUT_S,
+    REDIS_LOCK_TTL_S,
     PreflightError,
     advisory_lock_key,
     build_configured_manifest,
     parse_version,
+    _assert_lock_owned,
     _ensure_extension_version,
     _index_name,
     _is_legacy_default,
@@ -169,6 +172,29 @@ class TestEnsureExtensionVersion:
             dims=3072,
         )
         assert any("ALTER EXTENSION vector UPDATE" in sql for sql in conn.executed)
+
+
+class TestRedisLockOwnership:
+    def test_acquire_timeout_exceeds_ttl(self):
+        # A process must be able to outwait a lock abandoned by a crashed initializer.
+        assert REDIS_LOCK_ACQUIRE_TIMEOUT_S > REDIS_LOCK_TTL_S
+
+    def test_owned_lock_passes(self, mocker):
+        client = mocker.Mock()
+        client.get.return_value = "mytoken"
+        _assert_lock_owned(client, "k", "mytoken")  # no raise
+
+    def test_lock_taken_over_raises(self, mocker):
+        client = mocker.Mock()
+        client.get.return_value = "someone-else"
+        with pytest.raises(PreflightError, match="Lost the Redis"):
+            _assert_lock_owned(client, "k", "mytoken")
+
+    def test_expired_lock_raises(self, mocker):
+        client = mocker.Mock()
+        client.get.return_value = None
+        with pytest.raises(PreflightError, match="Lost the Redis"):
+            _assert_lock_owned(client, "k", "mytoken")
 
 
 if __name__ == "__main__":

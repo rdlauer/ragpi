@@ -91,8 +91,10 @@ class Settings(BaseSettings):
     # whole database). Off by default; preflight fails with guidance instead.
     PG_UPDATE_VECTOR_EXTENSION: bool = False
     # Retrieval tuning for the >2000-dim two-stage path: fetch top_k * multiplier
-    # candidates via the half-precision ANN index, then rerank by exact float32
-    # cosine. HNSW_EF_SEARCH pins hnsw.ef_search (None => derived from candidate count).
+    # candidates via the half-precision ANN index, then rerank by exact float32 cosine.
+    # HNSW_EF_SEARCH is a lower bound for hnsw.ef_search; the effective value is
+    # max(HNSW_EF_SEARCH or 0, candidate_count), capped at pgvector's limit of 1000,
+    # with iterative scans covering larger candidate sets.
     EMBEDDING_CANDIDATE_MULTIPLIER: int = 10
     HNSW_EF_SEARCH: int | None = None
 
@@ -124,10 +126,14 @@ class Settings(BaseSettings):
                 "EMBEDDING_DIMENSIONS > 4000 cannot be indexed by pgvector "
                 "(halfvec ivfflat/hnsw max is 4000)."
             )
+        if self.RETRIEVAL_TOP_K < 1:
+            raise ValueError("RETRIEVAL_TOP_K must be >= 1")
         if self.EMBEDDING_CANDIDATE_MULTIPLIER < 1:
             raise ValueError("EMBEDDING_CANDIDATE_MULTIPLIER must be >= 1")
-        if self.HNSW_EF_SEARCH is not None and self.HNSW_EF_SEARCH < 1:
-            raise ValueError("HNSW_EF_SEARCH must be >= 1")
+        # pgvector caps hnsw.ef_search at 1000; reject out-of-range up front rather
+        # than silently clamping.
+        if self.HNSW_EF_SEARCH is not None and not (1 <= self.HNSW_EF_SEARCH <= 1000):
+            raise ValueError("HNSW_EF_SEARCH must be between 1 and 1000")
         _openai_embedding_max = {
             "text-embedding-3-small": 1536,
             "text-embedding-3-large": 3072,
