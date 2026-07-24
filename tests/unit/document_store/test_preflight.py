@@ -57,6 +57,18 @@ class TestIndexName:
         assert len(n_a.encode()) <= 63
         assert n_a != n_b  # digest keeps distinct long namespaces from colliding
 
+    def test_non_ascii_name_truncated_by_bytes_not_chars(self):
+        # 25 x 'é' = 50 bytes; char-based truncation would overflow 63 bytes.
+        for suffix in ("embedding_idx", "embedding_halfvec_idx", "fts_vector_idx"):
+            name = _index_name("é" * 25, suffix)
+            encoded = name.encode("utf-8")
+            assert len(encoded) <= 63
+            assert encoded.decode("utf-8") == name  # no split code point
+        # distinct long non-ASCII namespaces still produce distinct names
+        assert _index_name("é" * 30, "embedding_idx") != _index_name(
+            "é" * 29 + "e", "embedding_idx"
+        )
+
 
 class TestBuildConfiguredManifest:
     def test_small_uses_vector_ivfflat(self):

@@ -93,10 +93,12 @@ def test_worker_exits_nonzero_and_reports_the_preflight_failure(
 def test_preflight_does_not_populate_the_global_engine(
     postgres_container: PostgresContainer,
 ) -> None:
-    """Prefork-safety contract: preflight uses a short-lived engine it disposes, so it
-    never leaves the process-global SQLAlchemy engine populated. This is what lets
-    Celery prefork children establish their own connections instead of inheriting the
-    parent's pool. (Also serves as a successful-preflight smoke test.)"""
+    """Prefork-safety contract: preflight uses a short-lived engine it disposes and
+    never populates the process-global SQLAlchemy engine. The resolved worker bootstep
+    order is Pool -> DocumentStorePreflight -> Consumer, so children are forked before
+    preflight even runs; keeping the global engine unpopulated means children start with
+    it unset and lazily create their own connections. (Also a successful-preflight
+    smoke test.)"""
     pg_url = postgres_container.get_connection_url()
     _drop_store(pg_url)
     pg_engine_module.dispose_postgres_engine()
@@ -132,15 +134,13 @@ def _wait_for_line(proc: subprocess.Popen, needle: str, timeout: float) -> tuple
     return False, "".join(seen)
 
 
-def test_prefork_worker_forks_children_and_becomes_ready(
+def test_prefork_child_can_query_the_store(
     redis_container: RedisContainer, postgres_container: PostgresContainer
 ) -> None:
-    """Complements the global-engine test with a real prefork run: the parent runs the
-    document-store preflight, then forks children (concurrency 2). Reaching 'ready'
-    proves the children forked and connected after the parent's preflight without
-    inheriting a broken pooled connection (the failure mode the fork-safe disposal
-    guards against). Combined with test_preflight_does_not_populate_the_global_engine,
-    this covers the prefork-safety contract."""
+    """End-to-end prefork proof: start a real worker with concurrency 2, wait until it
+    is ready, then enqueue a task that opens a child-owned database connection and runs
+    SELECT 1. Its success proves a forked child establishes its own connection after the
+    parent's preflight (the fork-safety contract) — not just that the worker booted."""
     redis_url = (
         f"redis://{redis_container.get_container_host_ip()}:"
         f"{redis_container.get_exposed_port(6379)}"
@@ -148,7 +148,6 @@ def test_prefork_worker_forks_children_and_becomes_ready(
     pg_url = postgres_container.get_connection_url()
     _drop_store(pg_url)
     pg_engine_module.dispose_postgres_engine()
-    run_preflight(_settings(pg_url))  # ensure a valid store exists so preflight passes
 
     env = {
         "PATH": "/usr/bin:/bin:/usr/local/bin",
@@ -163,6 +162,7 @@ def test_prefork_worker_forks_children_and_becomes_ready(
         [
             sys.executable, "-m", "celery", "-A", "src.celery.celery_app", "worker",
             "--pool=prefork", "-c", "2", "-l", "info",
+            "--include=tests.integration._bench_worker_tasks",
         ],
         cwd=str(REPO_ROOT),
         env=env,
@@ -174,6 +174,12 @@ def test_prefork_worker_forks_children_and_becomes_ready(
     try:
         ready, output = _wait_for_line(proc, "ready", timeout=90)
         assert ready, f"prefork worker did not become ready.\n{output}"
+
+        from celery import Celery
+
+        sender = Celery("bench_sender", broker=redis_url, backend=redis_url)
+        result = sender.send_task("_bench_store_ping")
+        assert result.get(timeout=60) == 1  # a forked child opened its own connection
     finally:
         proc.terminate()
         try:

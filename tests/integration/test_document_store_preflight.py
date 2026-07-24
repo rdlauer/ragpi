@@ -309,3 +309,32 @@ def test_compatible_manifest_but_wrong_index_build_params_fails(pg_url: str) -> 
     )
     with pytest.raises(PreflightError, match="no valid vector index"):
         run_preflight(settings)
+
+
+def test_vector_index_on_wrong_column_is_rejected(pg_url: str) -> None:
+    settings = _settings(pg_url)
+    run_preflight(settings)
+    # Otherwise-identical ivfflat index, but on a different column — must be rejected
+    # (a textual "embedding" substring check would wrongly accept "other_embedding").
+    _exec(
+        pg_url,
+        f'ALTER TABLE "{NS}" ADD COLUMN other_embedding vector(1536)',
+        f'DROP INDEX "{NS}_embedding_idx"',
+        f'CREATE INDEX "{NS}_embedding_idx" ON "{NS}" '
+        "USING ivfflat (other_embedding vector_cosine_ops) WITH (lists = 100)",
+    )
+    with pytest.raises(PreflightError, match="no valid vector index"):
+        run_preflight(settings)
+
+
+def test_fts_index_on_wrong_column_is_rejected(pg_url: str) -> None:
+    settings = _settings(pg_url)
+    run_preflight(settings)
+    _exec(
+        pg_url,
+        f'ALTER TABLE "{NS}" ADD COLUMN other_fts tsvector',
+        f'DROP INDEX "{NS}_fts_vector_idx"',
+        f'CREATE INDEX "{NS}_fts_vector_idx" ON "{NS}" USING gin (other_fts)',
+    )
+    with pytest.raises(PreflightError, match="full-text GIN index"):
+        run_preflight(settings)

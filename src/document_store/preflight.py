@@ -100,12 +100,16 @@ def _quote(name: str) -> str:
 
 
 def _index_name(namespace: str, suffix: str) -> str:
-    """Namespace-aware index name that respects PostgreSQL's 63-byte identifier limit."""
+    """Namespace-aware index name that always fits PostgreSQL's 63-BYTE identifier limit
+    (names longer than that are silently truncated by the server, which could collide).
+    Truncate the UTF-8 byte representation to the prefix budget without splitting a code
+    point, then append a stable digest so distinct long namespaces stay distinct."""
     name = f"{namespace}_{suffix}"
     if len(name.encode("utf-8")) <= 63:
         return name
     digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
-    prefix = name[: 63 - len(digest) - 1]
+    budget = 63 - len(digest) - 1  # bytes left for the readable prefix + the '_'
+    prefix = name.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
     return f"{prefix}_{digest}"
 
 
@@ -348,16 +352,22 @@ def _table_columns(conn, oid: int) -> dict[str, str]:
 
 
 def _table_indexes(conn, oid: int) -> list[dict[str, Any]]:
-    """Structured catalog info for every index on the table (by oid): name, definition,
-    access method, WITH options, validity, and whether it is partial — enough to verify
-    an index matches the manifest exactly rather than just superficially."""
+    """Structured catalog info for every index on the table (by oid). Includes the
+    access method, WITH options, validity, partiality, key count, the canonical
+    definition of the FIRST key column/expression (pg_get_indexdef(..., 1, ...) —
+    exact, so 'embedding' is distinguished from 'other_embedding'), and the opclass
+    names — enough to verify an index matches the manifest exactly."""
     rows = (
         conn.execute(
             text(
-                "SELECT c.relname AS name, pg_get_indexdef(i.indexrelid) AS indexdef, "
+                "SELECT c.relname AS name, "
+                "pg_get_indexdef(i.indexrelid, 1, true) AS key1_def, "
                 "am.amname AS method, c.reloptions AS reloptions, "
                 "i.indisvalid AS indisvalid, i.indisready AS indisready, "
-                "(i.indpred IS NOT NULL) AS is_partial "
+                "(i.indpred IS NOT NULL) AS is_partial, i.indnkeyatts AS indnkeyatts, "
+                "(SELECT array_agg(op.opcname ORDER BY k.ord) "
+                " FROM unnest(i.indclass::oid[]) WITH ORDINALITY AS k(oid, ord) "
+                " JOIN pg_opclass op ON op.oid = k.oid) AS opclasses "
                 "FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
                 "JOIN pg_am am ON am.oid = c.relam WHERE i.indrelid = :oid"
             ),
@@ -378,23 +388,30 @@ def _reloptions_dict(reloptions: Any) -> dict[str, str]:
     return result
 
 
+def _canon_expr(expr: str | None) -> str:
+    """Canonicalize an index key definition for comparison: drop whitespace and
+    parentheses and lowercase, so pg's '(embedding)::halfvec(3072)' equals the
+    configured 'embedding::halfvec(3072)', while 'other_embedding' stays distinct."""
+    return re.sub(r"[\s()]", "", expr or "").lower()
+
+
 def _index_matches_schema(idx: dict[str, Any], index_schema: IndexSchema) -> bool:
-    """True only if the index is a valid, ready, non-partial vector index that exactly
-    matches the configured algorithm, opclass, embedding expression, AND build params
-    (lists / m / ef_construction) — so a materially different index (e.g. lists=10 vs
-    100, or an index on another column) is rejected."""
+    """True only if the index is a valid, ready, non-partial, single-key vector index
+    whose access method, opclass, indexed column/expression, AND build params exactly
+    match the manifest — so an index on the wrong column, with the wrong opclass, or
+    with drifted build params (e.g. lists=10 vs 100) is rejected."""
     if not (idx["indisvalid"] and idx["indisready"]) or idx["is_partial"]:
+        return False
+    if idx["indnkeyatts"] != 1:
         return False
     if (idx["method"] or "").lower() != index_schema.algorithm:
         return False
-    low = (idx["indexdef"] or "").lower()
-    if index_schema.opclass not in low or "embedding" not in low:
+    opclasses = idx["opclasses"] or []
+    if len(opclasses) != 1 or opclasses[0] != index_schema.opclass:
         return False
-    if index_schema.expression:
-        cast = index_schema.expression.split("::", 1)[-1].strip().lower()  # halfvec(N)
-        if cast not in low:
-            return False
-    elif "halfvec" in low:  # a plain-column index must not be a half-precision cast index
+    # Exact indexed column (plain) or expression (halfvec cast) on `embedding`.
+    expected_key = index_schema.expression or "embedding"
+    if _canon_expr(idx["key1_def"]) != _canon_expr(expected_key):
         return False
     opts = _reloptions_dict(idx["reloptions"])
     for key, value in index_schema.build_params.items():
@@ -416,7 +433,8 @@ def _has_fts_index(indexes: list[dict[str, Any]]) -> bool:
     return any(
         idx["indisvalid"]
         and (idx["method"] or "").lower() == "gin"
-        and "fts_vector" in (idx["indexdef"] or "").lower()
+        and idx["indnkeyatts"] == 1
+        and _canon_expr(idx["key1_def"]) == "fts_vector"  # exact column, not a substring
         for idx in indexes
     )
 
