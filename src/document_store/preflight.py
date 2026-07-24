@@ -69,7 +69,6 @@ _REDIS_REQUIRED_FIELDS = {
     "embedding",
 }
 
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _COLTYPE_RE = re.compile(r"^([A-Za-z_]+)\s*(?:\((\d+)\))?$")
 
 
@@ -93,13 +92,10 @@ def parse_version(value: str | None) -> tuple[int, ...]:
     return tuple(int(n) for n in nums[:3]) if nums else (0,)
 
 
-def _validate_ident(name: str) -> str:
-    if not _IDENT_RE.match(name or ""):
-        raise PreflightError(f"Unsafe SQL identifier: {name!r}")
-    return name
-
-
 def _quote(name: str) -> str:
+    """Quote an SQL identifier. Any namespace is injection-safe once quoted (internal
+    quotes doubled), so arbitrary names like 'customer-docs' or 'MixedCase' are allowed
+    in DDL; catalog lookups resolve by exact name (see _resolve_table_oid)."""
     return '"' + name.replace('"', '""') + '"'
 
 
@@ -311,12 +307,20 @@ def _create_indexes(conn, namespace: str, dims: int) -> str:
     return emb_idx_name
 
 
-def _table_exists(conn, namespace: str) -> bool:
-    return bool(
-        conn.execute(
-            text("SELECT to_regclass(:q) IS NOT NULL"), {"q": namespace}
-        ).scalar()
-    )
+def _resolve_table_oid(conn, namespace: str) -> int | None:
+    """Resolve a table by EXACT name within the current search_path. Unlike passing a
+    bound string to to_regclass() (which parses/case-folds the name, so 'MixedCase' or
+    'customer-docs' misresolve), this matches pg_class.relname verbatim. Returns the
+    table oid, or None if it does not exist."""
+    return conn.execute(
+        text(
+            "SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relname = :name AND c.relkind IN ('r', 'p') "
+            "AND n.nspname = ANY(current_schemas(false)) "
+            "ORDER BY array_position(current_schemas(false), n.nspname) LIMIT 1"
+        ),
+        {"name": namespace},
+    ).scalar()
 
 
 # Columns the document-store table must physically have (mirrors the ORM model).
@@ -332,56 +336,88 @@ _REQUIRED_COLUMNS = {
 }
 
 
-def _table_columns(conn, namespace: str) -> dict[str, str]:
+def _table_columns(conn, oid: int) -> dict[str, str]:
     rows = conn.execute(
         text(
             "SELECT a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
-            "WHERE a.attrelid = to_regclass(:q) AND a.attnum > 0 AND NOT a.attisdropped"
+            "WHERE a.attrelid = :oid AND a.attnum > 0 AND NOT a.attisdropped"
         ),
-        {"q": namespace},
+        {"oid": oid},
     ).fetchall()
     return {row[0]: row[1] for row in rows}
 
 
-def _table_indexes(conn, namespace: str) -> list[tuple[str, str]]:
-    """(index name, indexdef) for every index on the table, resolved by the table's
-    oid so it is schema-accurate."""
-    rows = conn.execute(
-        text(
-            "SELECT c.relname, pg_get_indexdef(i.indexrelid) FROM pg_index i "
-            "JOIN pg_class c ON c.oid = i.indexrelid WHERE i.indrelid = to_regclass(:q)"
-        ),
-        {"q": namespace},
-    ).fetchall()
-    return [(row[0], row[1]) for row in rows]
+def _table_indexes(conn, oid: int) -> list[dict[str, Any]]:
+    """Structured catalog info for every index on the table (by oid): name, definition,
+    access method, WITH options, validity, and whether it is partial — enough to verify
+    an index matches the manifest exactly rather than just superficially."""
+    rows = (
+        conn.execute(
+            text(
+                "SELECT c.relname AS name, pg_get_indexdef(i.indexrelid) AS indexdef, "
+                "am.amname AS method, c.reloptions AS reloptions, "
+                "i.indisvalid AS indisvalid, i.indisready AS indisready, "
+                "(i.indpred IS NOT NULL) AS is_partial "
+                "FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                "JOIN pg_am am ON am.oid = c.relam WHERE i.indrelid = :oid"
+            ),
+            {"oid": oid},
+        )
+        .mappings()
+        .fetchall()
+    )
+    return [dict(row) for row in rows]
 
 
-def _find_vector_index(indexes: list[tuple[str, str]]) -> tuple[str, str] | None:
-    for name, indexdef in indexes:
-        low = indexdef.lower()
-        if "using ivfflat" in low or "using hnsw" in low:
-            return name, indexdef
+def _reloptions_dict(reloptions: Any) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for opt in reloptions or []:
+        if "=" in opt:
+            key, value = opt.split("=", 1)
+            result[key.strip()] = value.strip().strip("'\"")
+    return result
+
+
+def _index_matches_schema(idx: dict[str, Any], index_schema: IndexSchema) -> bool:
+    """True only if the index is a valid, ready, non-partial vector index that exactly
+    matches the configured algorithm, opclass, embedding expression, AND build params
+    (lists / m / ef_construction) — so a materially different index (e.g. lists=10 vs
+    100, or an index on another column) is rejected."""
+    if not (idx["indisvalid"] and idx["indisready"]) or idx["is_partial"]:
+        return False
+    if (idx["method"] or "").lower() != index_schema.algorithm:
+        return False
+    low = (idx["indexdef"] or "").lower()
+    if index_schema.opclass not in low or "embedding" not in low:
+        return False
+    if index_schema.expression:
+        cast = index_schema.expression.split("::", 1)[-1].strip().lower()  # halfvec(N)
+        if cast not in low:
+            return False
+    elif "halfvec" in low:  # a plain-column index must not be a half-precision cast index
+        return False
+    opts = _reloptions_dict(idx["reloptions"])
+    for key, value in index_schema.build_params.items():
+        if opts.get(key) != str(value):
+            return False
+    return True
+
+
+def _find_matching_vector_index(
+    indexes: list[dict[str, Any]], index_schema: IndexSchema
+) -> str | None:
+    for idx in indexes:
+        if _index_matches_schema(idx, index_schema):
+            return str(idx["name"])
     return None
 
 
-def _vector_index_matches(indexdef: str, index_schema: IndexSchema) -> bool:
-    low = indexdef.lower()
-    if f"using {index_schema.algorithm}" not in low:
-        return False
-    if index_schema.opclass not in low:
-        return False
-    if index_schema.expression:
-        # e.g. "embedding::halfvec(3072)" -> require the halfvec(dims) cast.
-        cast = index_schema.expression.split("::", 1)[-1].strip().lower()
-        return cast in low
-    # Plain-column index must not be a half-precision cast index.
-    return "halfvec" not in low
-
-
-def _has_fts_index(indexes: list[tuple[str, str]]) -> bool:
+def _has_fts_index(indexes: list[dict[str, Any]]) -> bool:
     return any(
-        "using gin" in indexdef.lower() and "fts_vector" in indexdef.lower()
-        for _, indexdef in indexes
+        idx["indisvalid"]
+        and (idx["method"] or "").lower() == "gin"
+        and "fts_vector" in (idx["indexdef"] or "").lower()
+        for idx in indexes
     )
 
 
@@ -393,14 +429,15 @@ def _validate_physical_store(
     this runs on both the manifest-present (restart) and legacy-adoption paths. Raises
     PreflightError with specific guidance on any drift; returns the vector index name.
     Structural failures here are NOT overridable by EMBEDDING_ADOPT_EXISTING."""
-    if not _table_exists(conn, namespace):
+    oid = _resolve_table_oid(conn, namespace)
+    if oid is None:
         raise PreflightError(
             f"Document store '{namespace}' has a manifest but its table is missing. The store "
             "appears to have been dropped — delete the manifest row and restart to recreate it, "
             "then re-embed all sources."
         )
 
-    columns = _table_columns(conn, namespace)
+    columns = _table_columns(conn, oid)
     missing = sorted(_REQUIRED_COLUMNS - set(columns))
     if missing:
         raise PreflightError(
@@ -422,19 +459,14 @@ def _validate_physical_store(
             "dimensions/type requires recreating the store and re-embedding all sources."
         )
 
-    indexes = _table_indexes(conn, namespace)
-    vector_index = _find_vector_index(indexes)
-    if vector_index is None:
+    indexes = _table_indexes(conn, oid)
+    index_name = _find_matching_vector_index(indexes, configured.index_schema)
+    if index_name is None:
         raise PreflightError(
-            f"Document store '{namespace}' has no vector index on 'embedding'. Rebuild the "
-            f"{configured.index_schema.algorithm}/{configured.index_schema.opclass} index."
-        )
-    index_name, indexdef = vector_index
-    if not _vector_index_matches(indexdef, configured.index_schema):
-        raise PreflightError(
-            f"Document store '{namespace}' vector index '{index_name}' does not match the "
+            f"Document store '{namespace}' has no valid vector index exactly matching the "
             f"configured {configured.index_schema.algorithm}/{configured.index_schema.opclass} "
-            f"definition (found: {indexdef}). Rebuild the vector index."
+            f"definition on 'embedding' with build params {configured.index_schema.build_params}. "
+            "Rebuild the vector index (see 'Changing the vector index' in the README)."
         )
     if not _has_fts_index(indexes):
         raise PreflightError(
@@ -491,7 +523,7 @@ def _create_fresh(conn, configured: StoreManifest, namespace: str, dims: int) ->
 
 def _pg_preflight(engine: Engine, settings: Settings) -> None:
     configured = build_configured_manifest(settings)
-    namespace = _validate_ident(settings.DOCUMENT_STORE_NAMESPACE)
+    namespace = settings.DOCUMENT_STORE_NAMESPACE
     dims = settings.EMBEDDING_DIMENSIONS
 
     with engine.begin() as conn:
@@ -511,7 +543,7 @@ def _pg_preflight(engine: Engine, settings: Settings) -> None:
             logger.info("Document store '%s' is compatible and physically valid.", namespace)
             return
 
-        if _table_exists(conn, namespace):
+        if _resolve_table_oid(conn, namespace) is not None:
             _adopt_legacy(conn, settings, configured, namespace)
         else:
             _create_fresh(conn, configured, namespace, dims)
@@ -652,7 +684,7 @@ def _redis_preflight(client: Any, settings: Settings) -> None:
     from src.document_store.redis.store import build_index_schema
 
     configured = build_configured_manifest(settings, backend="redis")
-    name = _validate_ident(settings.DOCUMENT_STORE_NAMESPACE)
+    name = settings.DOCUMENT_STORE_NAMESPACE
     dims = settings.EMBEDDING_DIMENSIONS
     manifest_key = f"{name}:__manifest__"
     marker_key = f"{name}:__init__"

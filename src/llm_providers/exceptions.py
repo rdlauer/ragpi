@@ -45,10 +45,14 @@ def handle_openai_client_error(e: APIError, model: str) -> None:
     # often null here) so this only fires on a genuine endpoint-capability error.
     message = (e.message or "").lower()
     param = getattr(e, "param", None)
+    # Only fire on *directional* signals that the request should move TO the Responses
+    # API (sent to chat.completions but needs responses). A bare "v1/responses" match
+    # would misfire on errors like "not supported in /v1/responses" when Responses is
+    # already enabled, wrongly advising the operator to enable it.
     if (
-        "v1/responses" in message
-        or "not supported in v1/chat/completions" in message
-        or (param == "reasoning_effort" and "responses" in message)
+        "use /v1/responses" in message
+        or "use the responses api" in message
+        or (param == "reasoning_effort" and "chat/completions" in message)
     ):
         raise KnownException(
             f"Model '{model}' requires the OpenAI Responses API for this request. Enable it "

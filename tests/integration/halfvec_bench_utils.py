@@ -234,14 +234,20 @@ def run_sweep(
     seed: int = 1234,
     recall_threshold: float = 0.98,
     p95_budget_ms: float | None = None,
+    source_sizes: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     """Populate an uneven multi-source corpus, then sweep candidate_multiplier x
     ef_search — reporting recall@k vs exhaustive float32, p50/p95 latency, HNSW build
     time (over the populated table), insertion throughput, and index size — and
     recommend the smallest (multiplier, ef_search) meeting the recall (and optional
-    p95) thresholds. This implements the plan's performance acceptance gate; run it on
-    representative hardware (p95 is machine-dependent, so it is not asserted in CI)."""
-    source_sizes = {"big": 2000, "medium": 800, "small": 150}
+    p95) thresholds. Run on representative hardware (p95 is machine-dependent, so it is
+    not asserted in CI).
+
+    Caveats for qualifying production defaults: this uses SYNTHETIC clustered vectors,
+    not real embeddings; scale `source_sizes` up (defaults are modest) and, ideally,
+    feed a corpus embedded with the real target model before certifying a multiplier.
+    It also does not compare latency against the <=2000 direct-cosine path."""
+    source_sizes = source_sizes or {"big": 2000, "medium": 800, "small": 150}
     top_k = 10
     corpus = generate_corpus(source_sizes, seed=seed)
     queries = generate_queries(corpus, seed=seed + 1, per_source=40)

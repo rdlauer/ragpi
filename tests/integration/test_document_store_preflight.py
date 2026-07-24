@@ -11,6 +11,7 @@ from src.document_store.preflight import (
     MANIFEST_TABLE,
     PreflightError,
     _create_indexes,
+    _resolve_table_oid,
     build_configured_manifest,
     run_preflight,
 )
@@ -223,7 +224,7 @@ def test_compatible_manifest_but_missing_vector_index_fails(pg_url: str) -> None
     settings = _settings(pg_url)
     run_preflight(settings)
     _exec(pg_url, f'DROP INDEX "{NS}_embedding_idx"')
-    with pytest.raises(PreflightError, match="no vector index"):
+    with pytest.raises(PreflightError, match="no valid vector index"):
         run_preflight(settings)
 
 
@@ -240,7 +241,7 @@ def test_legacy_adoption_requires_a_vector_index(pg_url: str) -> None:
     run_preflight(settings)
     # Simulate a legacy store with the vector index missing and no manifest.
     _exec(pg_url, f"DROP TABLE {MANIFEST_TABLE}", f'DROP INDEX "{NS}_embedding_idx"')
-    with pytest.raises(PreflightError, match="no vector index"):
+    with pytest.raises(PreflightError, match="no valid vector index"):
         run_preflight(settings)
 
 
@@ -255,7 +256,7 @@ def test_legacy_adoption_rejects_wrong_opclass(pg_url: str) -> None:
         f'CREATE INDEX "{NS}_embedding_idx" ON "{NS}" '
         "USING ivfflat (embedding vector_l2_ops) WITH (lists = 100)",
     )
-    with pytest.raises(PreflightError, match="does not match the configured"):
+    with pytest.raises(PreflightError, match="no valid vector index"):
         run_preflight(settings)
 
 
@@ -276,3 +277,35 @@ def test_adopted_legacy_index_name_recorded_and_survives_restart(pg_url: str) ->
 
     run_preflight(settings)  # restart: compatible manifest + physical validation passes
     assert _read_manifest(pg_url).index_schema.name == "embedding_idx"  # type: ignore[union-attr]
+
+
+def test_resolve_table_oid_is_exact_and_case_sensitive(pg_url: str) -> None:
+    # to_regclass() on a bound string case-folds ('MixedCase' -> mixedcase) and cannot
+    # parse names like 'customer-docs'; our resolver matches pg_class.relname verbatim.
+    engine = create_engine(pg_url)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text('CREATE TABLE "MixedCase" (id text)'))
+            conn.execute(text('CREATE TABLE "customer-docs" (id text)'))
+            assert conn.execute(text("SELECT to_regclass('MixedCase')")).scalar() is None
+            assert _resolve_table_oid(conn, "MixedCase") is not None
+            assert _resolve_table_oid(conn, "mixedcase") is None  # exact, not folded
+            assert _resolve_table_oid(conn, "customer-docs") is not None  # hyphens allowed now
+            conn.execute(text('DROP TABLE "MixedCase"'))
+            conn.execute(text('DROP TABLE "customer-docs"'))
+    finally:
+        engine.dispose()
+
+
+def test_compatible_manifest_but_wrong_index_build_params_fails(pg_url: str) -> None:
+    settings = _settings(pg_url)
+    run_preflight(settings)  # ivfflat lists=100 + manifest
+    # Recreate the vector index with different build params (lists=10), same algo/opclass.
+    _exec(
+        pg_url,
+        f'DROP INDEX "{NS}_embedding_idx"',
+        f'CREATE INDEX "{NS}_embedding_idx" ON "{NS}" '
+        "USING ivfflat (embedding vector_cosine_ops) WITH (lists = 10)",
+    )
+    with pytest.raises(PreflightError, match="no valid vector index"):
+        run_preflight(settings)

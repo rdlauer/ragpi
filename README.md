@@ -141,6 +141,23 @@ documents. There is no automatic data migration. Do **not** use `docker compose 
 5. Re-sync every source (connectors re-fetch and re-embed).
 6. Verify document counts and semantic-search results.
 
+#### Changing the vector index (without re-embedding)
+
+If only the index definition changes (algorithm, opclass, or build params like `lists` /
+`m` / `ef_construction`) — not the embedding model or dimensions — the stored vectors are
+still valid, so you can rebuild just the index:
+
+1. Stop the API and workers.
+2. Rebuild the vector index to the new definition (drop the old index, `CREATE` the new one
+   with the new parameters). Stored vectors are untouched.
+3. Reset the manifest so preflight re-derives it from the new physical index:
+   - **Postgres:** `DELETE FROM ragpi_store_manifest WHERE namespace = '<DOCUMENT_STORE_NAMESPACE>';`
+   - **Redis:** `DEL <namespace>:__manifest__`
+4. Restart. Preflight adopts the existing store, validates that the physical index exactly
+   matches the configured definition, and writes the updated manifest — no re-embedding. If
+   the embedding model is not the legacy default, set `EMBEDDING_ADOPT_EXISTING=true` for the
+   restart.
+
 If a persistent store is left un-migrated after a dimension/model change, startup fails with
 guidance rather than corrupting data. For an existing pre-0.8.2 pgvector extension on the
 large path, set `PG_UPDATE_VECTOR_EXTENSION=true` to run `ALTER EXTENSION vector UPDATE` at

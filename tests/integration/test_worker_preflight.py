@@ -1,5 +1,8 @@
+import queue
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 from sqlalchemy import create_engine, text
@@ -103,3 +106,78 @@ def test_preflight_does_not_populate_the_global_engine(
 
     assert pg_engine_module._engine is None
     _drop_store(pg_url)
+
+
+def _wait_for_line(proc: subprocess.Popen, needle: str, timeout: float) -> tuple[bool, str]:
+    lines: "queue.Queue[str]" = queue.Queue()
+
+    def _reader() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            lines.put(line)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    deadline = time.monotonic() + timeout
+    seen: list[str] = []
+    while time.monotonic() < deadline:
+        try:
+            line = lines.get(timeout=1.0)
+        except queue.Empty:
+            if proc.poll() is not None:
+                break
+            continue
+        seen.append(line)
+        if needle in line:
+            return True, "".join(seen)
+    return False, "".join(seen)
+
+
+def test_prefork_worker_forks_children_and_becomes_ready(
+    redis_container: RedisContainer, postgres_container: PostgresContainer
+) -> None:
+    """Complements the global-engine test with a real prefork run: the parent runs the
+    document-store preflight, then forks children (concurrency 2). Reaching 'ready'
+    proves the children forked and connected after the parent's preflight without
+    inheriting a broken pooled connection (the failure mode the fork-safe disposal
+    guards against). Combined with test_preflight_does_not_populate_the_global_engine,
+    this covers the prefork-safety contract."""
+    redis_url = (
+        f"redis://{redis_container.get_container_host_ip()}:"
+        f"{redis_container.get_exposed_port(6379)}"
+    )
+    pg_url = postgres_container.get_connection_url()
+    _drop_store(pg_url)
+    pg_engine_module.dispose_postgres_engine()
+    run_preflight(_settings(pg_url))  # ensure a valid store exists so preflight passes
+
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "PYTHONPATH": str(REPO_ROOT),
+        "OPENAI_API_KEY": "test-key",
+        "REDIS_URL": redis_url,
+        "DOCUMENT_STORE_BACKEND": "postgres",
+        "POSTGRES_URL": pg_url,
+        "OBJC_DISABLE_INITIALIZE_FORK_SAFETY": "YES",  # macOS fork-safety for billiard
+    }
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-m", "celery", "-A", "src.celery.celery_app", "worker",
+            "--pool=prefork", "-c", "2", "-l", "info",
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        ready, output = _wait_for_line(proc, "ready", timeout=90)
+        assert ready, f"prefork worker did not become ready.\n{output}"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        _drop_store(pg_url)

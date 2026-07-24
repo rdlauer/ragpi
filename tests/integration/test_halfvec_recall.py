@@ -18,10 +18,14 @@ RECALL_THRESHOLD = 0.98
 
 
 def test_default_config_meets_recall_threshold(postgres_container: PostgresContainer) -> None:
-    """Sources are larger than the candidate count (top_k * default multiplier = 100),
-    so the halfvec ANN genuinely filters and this measures real recall (not a trivial
-    fetch-everything). Recall@10 vs exhaustive float32 must clear the threshold on both
-    the aggregate and the worst source, at the shipped default multiplier of 10."""
+    """Regression SMOKE test — not a production accuracy qualification. Sources here are
+    small (500/200) so the candidate count (top_k * 10 = 100) retains a large fraction of
+    each source, and queries are synthetic perturbations of stored vectors; this only
+    guards against a gross recall regression in the two-stage path. Qualify the shipped
+    tuning defaults with the benchmark (scripts/benchmark_halfvec_retrieval.py) against
+    real embeddings and much larger, uneven sources before treating them as
+    accuracy/performance-certified. Recall@10 vs exhaustive float32 must clear the
+    threshold on both the aggregate and the worst source at the default multiplier of 10."""
     url = create_engine(postgres_container.get_connection_url())
     try:
         corpus = generate_corpus({"big": 500, "medium": 200}, seed=7)
