@@ -464,3 +464,43 @@ def test_reasoning_model_error_maps_to_actionable_message(
 
     with pytest.raises(KnownException, match="Responses API"):
         responses_chat_service.generate_response(sample_chat_input)
+
+
+def test_reasoning_effort_ignored_when_responses_disabled(
+    chat_service: ChatService,
+    mock_openai_client: OpenAI,
+    mocker: MockerFixture,
+) -> None:
+    # chat_service has use_responses_api=False (the default / legacy path).
+    completion = ChatCompletion(
+        id="c1",
+        choices=[
+            Choice(
+                finish_reason="stop",
+                index=0,
+                message=ChatCompletionMessage(content="answer", role="assistant"),
+            )
+        ],
+        created=1,
+        model="gpt-4o",
+        object="chat.completion",
+    )
+    create = mocker.patch.object(
+        mock_openai_client.chat.completions, "create", return_value=completion
+    )
+    responses_create = mocker.patch.object(mock_openai_client.responses, "create")
+
+    request = CreateChatRequest(
+        messages=[ChatMessage(role="user", content="hi")],
+        model="gpt-4o",
+        reasoning_effort="high",  # supplied, but path is off
+        sources=["source1"],
+    )
+    response = chat_service.generate_response(request)
+
+    assert response.message == "answer"
+    create.assert_called_once()
+    responses_create.assert_not_called()  # legacy path never touches client.responses
+    # reasoning_effort must not leak into the Chat Completions request.
+    assert "reasoning" not in create.call_args.kwargs
+    assert "reasoning_effort" not in create.call_args.kwargs
