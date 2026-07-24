@@ -70,6 +70,15 @@ class Settings(BaseSettings):
     DEFAULT_CHAT_MODEL: str = "gpt-4o"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     EMBEDDING_DIMENSIONS: int = 1536  # Default for text-embedding-3-small model
+    # Non-secret endpoint-space identity override for openai-compatible/ollama
+    # embedding providers (see the store manifest). None => derived from the base URL.
+    EMBEDDING_SPACE_ID: str | None = None
+    # Allow adopting an existing (pre-manifest) store whose embedding model cannot be
+    # verified from dimensions alone. Only needed for non-default legacy configs.
+    EMBEDDING_ADOPT_EXISTING: bool = False
+    # Operator-authorized `ALTER EXTENSION vector UPDATE` at preflight (affects the
+    # whole database). Off by default; preflight fails with guidance instead.
+    PG_UPDATE_VECTOR_EXTENSION: bool = False
 
     # GitHub
     GITHUB_TOKEN: str | None = None
@@ -88,6 +97,30 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_llm_providers(self):
         return validate_provider_settings(self)
+
+    @model_validator(mode="after")
+    def validate_embedding_dimensions(self):
+        # Advisory bounds only — never reject unknown models or non-openai providers.
+        if self.EMBEDDING_DIMENSIONS < 1:
+            raise ValueError("EMBEDDING_DIMENSIONS must be >= 1")
+        if self.DOCUMENT_STORE_BACKEND == "postgres" and self.EMBEDDING_DIMENSIONS > 4000:
+            raise ValueError(
+                "EMBEDDING_DIMENSIONS > 4000 cannot be indexed by pgvector "
+                "(halfvec ivfflat/hnsw max is 4000)."
+            )
+        _openai_embedding_max = {
+            "text-embedding-3-small": 1536,
+            "text-embedding-3-large": 3072,
+            "text-embedding-ada-002": 1536,
+        }
+        if self.EMBEDDING_PROVIDER == EmbeddingProvider.OPENAI:
+            max_dims = _openai_embedding_max.get(self.EMBEDDING_MODEL)
+            if max_dims and self.EMBEDDING_DIMENSIONS > max_dims:
+                raise ValueError(
+                    f"EMBEDDING_DIMENSIONS={self.EMBEDDING_DIMENSIONS} exceeds the maximum "
+                    f"({max_dims}) for OpenAI model '{self.EMBEDDING_MODEL}'."
+                )
+        return self
 
     @field_validator("LOG_LEVEL", mode="before")
     def normalize_log_level(cls, v: Any):

@@ -1,7 +1,7 @@
 from datetime import timedelta
 import logging
 from typing import Any
-from celery import Celery, signals
+from celery import Celery, bootsteps, signals
 from celery.app.task import Context
 from fastapi import Request
 
@@ -42,6 +42,23 @@ def handle_task_revoked(
     }
     state = type.upper()
     celery_app.backend.store_result(task_id=task_id, result=meta, state=state)  # type: ignore
+
+
+class DocumentStorePreflight(bootsteps.StartStopStep):
+    """Validate/prepare the document store once in the worker parent before it
+    accepts tasks. A failure raises here and aborts worker startup with a nonzero
+    exit (bootstep exceptions propagate, unlike signal receivers). run_preflight
+    uses a short-lived engine it disposes, so no connections are inherited across
+    prefork into child processes.
+    """
+
+    def start(self, parent: Any) -> None:
+        from src.document_store.preflight import run_preflight
+
+        run_preflight(get_settings())
+
+
+celery_app.steps["worker"].add(DocumentStorePreflight)
 
 
 def get_celery_app(request: Request) -> Celery:

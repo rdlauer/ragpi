@@ -1,4 +1,4 @@
-from sqlalchemy import Engine, text, func
+from sqlalchemy import Engine, func
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
 import numpy as np
@@ -6,7 +6,7 @@ from openai import OpenAI
 
 from src.document_store.schemas import Document
 from src.document_store.base import DocumentStoreBackend
-from src.document_store.postgres.model import DocumentStoreModel, Base
+from src.document_store.postgres.model import DocumentStoreModel
 from src.document_store.ranking import reciprocal_rank_fusion
 
 
@@ -25,10 +25,8 @@ class PostgresDocumentStore(DocumentStoreBackend):
         self.embedding_model = embedding_model
         self.embedding_dimensions = embedding_dimensions
         self.DocumentModel = DocumentStoreModel
-
-        with self.engine.begin() as conn:
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            Base.metadata.create_all(conn)
+        # Schema/extension creation is handled once at startup by the document-store
+        # preflight (src/document_store/preflight.py), not per-request here.
 
     def _map_document(self, doc: DocumentStoreModel) -> Document:
         return Document(
