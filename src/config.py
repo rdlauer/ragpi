@@ -68,6 +68,17 @@ class Settings(BaseSettings):
 
     # Model Settings
     DEFAULT_CHAT_MODEL: str = "gpt-4o"
+    # Opt-in OpenAI Responses API path for reasoning models (e.g. gpt-5.6-sol/terra).
+    # Only valid with CHAT_PROVIDER=openai; when off, chat uses Chat Completions.
+    CHAT_USE_RESPONSES_API: bool = False
+    REASONING_EFFORT: (
+        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None
+    ) = None
+    # `store` sent to the Responses API. Kept True (stateful; previous_response_id is
+    # used for within-request tool continuity). false (Zero-Data-Retention / manual
+    # replay) is not yet supported. NOTE: store=True sends conversation state into
+    # OpenAI's stored Responses workflow.
+    OPENAI_RESPONSES_STORE: bool = True
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     EMBEDDING_DIMENSIONS: int = 1536  # Default for text-embedding-3-small model
     # Non-secret endpoint-space identity override for openai-compatible/ollama

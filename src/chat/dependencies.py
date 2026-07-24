@@ -23,4 +23,7 @@ def get_chat_service(
         chat_history_limit=settings.CHAT_HISTORY_LIMIT,
         max_iterations=settings.MAX_CHAT_ITERATIONS,
         retrieval_top_k=settings.RETRIEVAL_TOP_K,
+        use_responses_api=settings.CHAT_USE_RESPONSES_API,
+        reasoning_effort=settings.REASONING_EFFORT,
+        responses_store=settings.OPENAI_RESPONSES_STORE,
     )

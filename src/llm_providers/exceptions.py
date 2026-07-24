@@ -40,6 +40,21 @@ def handle_openai_client_error(e: APIError, model: str) -> None:
     if "does not support Function Calling" in e.message:
         raise KnownException(f"Model '{model}' is not supported.")
 
+    # Reasoning model that needs the Responses API for function tools + active
+    # reasoning. Key on param/type + a narrow message check (OpenAI's `code` is
+    # often null here) so this only fires on a genuine endpoint-capability error.
+    message = (e.message or "").lower()
+    param = getattr(e, "param", None)
+    if (
+        "v1/responses" in message
+        or "not supported in v1/chat/completions" in message
+        or (param == "reasoning_effort" and "responses" in message)
+    ):
+        raise KnownException(
+            f"Model '{model}' requires the OpenAI Responses API for this request. Enable it "
+            "with CHAT_USE_RESPONSES_API=true (and CHAT_PROVIDER=openai) to use reasoning models."
+        )
+
     logging.error(e)
 
     raise KnownException(

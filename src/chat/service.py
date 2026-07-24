@@ -1,4 +1,6 @@
+import copy
 import json
+from typing import Any
 from openai import APIError, OpenAI, pydantic_function_tool
 from openai.types.chat import (
     ChatCompletionMessageParam,
@@ -8,6 +10,7 @@ from openai.types.chat import (
     ChatCompletionToolMessageParam,
     ChatCompletionMessageToolCall,
 )
+from openai.types.responses import ResponseFunctionToolCall
 
 from src.chat.exceptions import ChatException
 from src.chat.prompts import get_system_prompt
@@ -33,6 +36,9 @@ class ChatService:
         chat_history_limit: int,
         max_iterations: int,
         retrieval_top_k: int,
+        use_responses_api: bool = False,
+        reasoning_effort: str | None = None,
+        responses_store: bool = True,
     ):
         self.chat_client = openai_client
         self.source_service = source_service
@@ -42,6 +48,9 @@ class ChatService:
         self.chat_history_limit = chat_history_limit
         self.max_iterations = max_iterations
         self.retrieval_top_k = retrieval_top_k
+        self.use_responses_api = use_responses_api
+        self.reasoning_effort = reasoning_effort
+        self.responses_store = responses_store
         self.tools = [
             pydantic_function_tool(
                 model=tool.model,
@@ -50,6 +59,22 @@ class ChatService:
             )
             for tool in tool_definitions
         ]
+        # Flat Responses-API tool schema, deep-copied from the chat-completions tools
+        # so flattening can never mutate the (nested) chat schema.
+        self.responses_tools: list[dict[str, Any]] = [
+            self._to_responses_tool(tool) for tool in self.tools
+        ]
+
+    @staticmethod
+    def _to_responses_tool(chat_tool: Any) -> dict[str, Any]:
+        fn = copy.deepcopy(dict(chat_tool)["function"])
+        return {
+            "type": "function",
+            "name": fn["name"],
+            "description": fn.get("description"),
+            "parameters": fn.get("parameters"),
+            "strict": fn.get("strict", True),
+        }
 
     def _get_sources(
         self, source_names: list[str] | None = None
@@ -78,15 +103,14 @@ class ChatService:
             ChatCompletionUserMessageParam(role="user", content=user_message),
         ]
 
-    def _handle_tool_call(
-        self,
-        tool_call: ChatCompletionMessageToolCall,
-    ) -> ChatCompletionToolMessageParam:
-        """Handle a tool call and append the result to messages."""
-        if tool_call.function.name != "retrieve_documents":
-            raise ValueError(f"Unknown tool call: {tool_call.function.name}")
+    def _retrieve_documents(self, name: str, arguments: str) -> str:
+        """Run the retrieve_documents tool and return its JSON result. Shared by the
+        Chat Completions and Responses tool-call loops (only the surrounding message
+        shapes differ)."""
+        if name != "retrieve_documents":
+            raise ValueError(f"Unknown tool call: {name}")
 
-        args = json.loads(tool_call.function.arguments)
+        args = json.loads(arguments)
         source_input = RetrieveDocuments(**args)
         documents = self.source_service.search_source(
             source_name=source_input.source_name,
@@ -94,11 +118,18 @@ class ChatService:
             full_text_query=source_input.full_text_query,
             top_k=self.retrieval_top_k,
         )
-
-        content = json.dumps(
+        return json.dumps(
             [{"url": doc.url, "content": doc.content} for doc in documents]
         )
 
+    def _handle_tool_call(
+        self,
+        tool_call: ChatCompletionMessageToolCall,
+    ) -> ChatCompletionToolMessageParam:
+        """Handle a Chat Completions tool call."""
+        content = self._retrieve_documents(
+            tool_call.function.name, tool_call.function.arguments
+        )
         return ChatCompletionToolMessageParam(
             tool_call_id=tool_call.id,
             content=content,
@@ -106,9 +137,10 @@ class ChatService:
         )
 
     def generate_response(self, chat_input: CreateChatRequest) -> ChatResponse:
-        """Generate a response based on chat input."""
+        """Generate a response based on chat input, dispatching to the opt-in
+        Responses API path (OpenAI reasoning models) or the default Chat Completions
+        path used by every other provider/model."""
         try:
-            # Initialize chat context
             sources = self._get_sources(chat_input.sources)
             system_prompt = get_system_prompt(
                 project_name=self.project_name,
@@ -118,50 +150,118 @@ class ChatService:
                 max_attempts=self.max_iterations,
             )
 
-            # Prepare chat history
-            chat_history: list[ChatCompletionMessageParam] = [
-                (
-                    ChatCompletionUserMessageParam(role="user", content=msg.content)
-                    if msg.role == "user"
-                    else ChatCompletionAssistantMessageParam(
-                        role="assistant", content=msg.content
-                    )
-                )
-                for msg in chat_input.messages[-self.chat_history_limit : -1]
-            ]
-
-            messages = self._create_chat_messages(
-                system_prompt, chat_history, chat_input.messages[-1].content
-            )
-
-            # Generate response
-            for _ in range(self.max_iterations):
-                response = self.chat_client.chat.completions.create(
-                    model=chat_input.model,
-                    messages=messages,
-                    tools=self.tools,
-                )
-
-                message = response.choices[0].message
-                messages.append(message)  # type: ignore
-
-                if message.tool_calls:
-                    for tool_call in message.tool_calls:
-                        tool_response = self._handle_tool_call(tool_call)  # type: ignore
-                        messages.append(tool_response)
-                elif message.content:
-                    return ChatResponse(message=message.content)
-                else:
-                    raise ValueError(
-                        "No response content or tool call found in completion."
-                    )
-
-            return ChatResponse(
-                message="I'm sorry, but I don't have the information you're looking for."
-            )
+            if self.use_responses_api:
+                return self._generate_via_responses(chat_input, system_prompt)
+            return self._generate_via_chat_completions(chat_input, system_prompt)
 
         except ChatException as e:
             raise KnownException(str(e))
         except APIError as e:
             handle_openai_client_error(e, chat_input.model)
             raise e
+
+    def _generate_via_chat_completions(
+        self, chat_input: CreateChatRequest, system_prompt: str
+    ) -> ChatResponse:
+        # Prepare chat history
+        chat_history: list[ChatCompletionMessageParam] = [
+            (
+                ChatCompletionUserMessageParam(role="user", content=msg.content)
+                if msg.role == "user"
+                else ChatCompletionAssistantMessageParam(
+                    role="assistant", content=msg.content
+                )
+            )
+            for msg in chat_input.messages[-self.chat_history_limit : -1]
+        ]
+
+        messages = self._create_chat_messages(
+            system_prompt, chat_history, chat_input.messages[-1].content
+        )
+
+        # Generate response
+        for _ in range(self.max_iterations):
+            response = self.chat_client.chat.completions.create(
+                model=chat_input.model,
+                messages=messages,
+                tools=self.tools,
+            )
+
+            message = response.choices[0].message
+            messages.append(message)  # type: ignore
+
+            if message.tool_calls:
+                for tool_call in message.tool_calls:
+                    tool_response = self._handle_tool_call(tool_call)  # type: ignore
+                    messages.append(tool_response)
+            elif message.content:
+                return ChatResponse(message=message.content)
+            else:
+                raise ValueError(
+                    "No response content or tool call found in completion."
+                )
+
+        return ChatResponse(
+            message="I'm sorry, but I don't have the information you're looking for."
+        )
+
+    def _generate_via_responses(
+        self, chat_input: CreateChatRequest, system_prompt: str
+    ) -> ChatResponse:
+        """Reasoning + tools via the OpenAI Responses API. Reasoning continuity is
+        preserved across the internal tool-call loop (previous_response_id) within
+        this single request; conversation history is passed as input items."""
+        effort = chat_input.reasoning_effort or self.reasoning_effort
+
+        input_items: list[dict[str, Any]] = [
+            {"role": msg.role, "content": msg.content}
+            for msg in chat_input.messages[-self.chat_history_limit : -1]
+        ]
+        input_items.append(
+            {"role": "user", "content": chat_input.messages[-1].content}
+        )
+
+        kwargs: dict[str, Any] = {}
+        if self.responses_tools:
+            kwargs["tools"] = self.responses_tools
+        if effort:
+            kwargs["reasoning"] = {"effort": effort}
+
+        previous_response_id: str | None = None
+        for _ in range(self.max_iterations):
+            response = self.chat_client.responses.create(
+                model=chat_input.model,
+                instructions=system_prompt,
+                input=input_items,  # type: ignore[arg-type]
+                store=self.responses_store,
+                previous_response_id=previous_response_id,
+                **kwargs,
+            )
+
+            function_calls = [
+                item
+                for item in response.output
+                if isinstance(item, ResponseFunctionToolCall)
+            ]
+
+            if function_calls:
+                previous_response_id = response.id
+                input_items = []
+                for call in function_calls:
+                    output = self._retrieve_documents(call.name, call.arguments)
+                    input_items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": call.call_id,
+                            "output": output,
+                        }
+                    )
+                continue
+
+            if response.output_text:
+                return ChatResponse(message=response.output_text)
+            raise ValueError("No response content or tool call found in response.")
+
+        return ChatResponse(
+            message="I'm sorry, but I don't have the information you're looking for."
+        )
