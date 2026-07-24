@@ -338,3 +338,17 @@ def test_fts_index_on_wrong_column_is_rejected(pg_url: str) -> None:
     )
     with pytest.raises(PreflightError, match="full-text GIN index"):
         run_preflight(settings)
+
+
+def test_partial_fts_index_is_rejected(pg_url: str) -> None:
+    settings = _settings(pg_url)
+    run_preflight(settings)
+    # A partial predicate can leave some sources without usable FTS indexing.
+    _exec(
+        pg_url,
+        f'DROP INDEX "{NS}_fts_vector_idx"',
+        f'CREATE INDEX "{NS}_fts_vector_idx" ON "{NS}" USING gin (fts_vector) '
+        "WHERE id IS NOT NULL",
+    )
+    with pytest.raises(PreflightError, match="full-text GIN index"):
+        run_preflight(settings)

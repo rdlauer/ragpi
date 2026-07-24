@@ -432,8 +432,11 @@ def _find_matching_vector_index(
 def _has_fts_index(indexes: list[dict[str, Any]]) -> bool:
     return any(
         idx["indisvalid"]
+        and idx["indisready"]
+        and not idx["is_partial"]  # a partial predicate can leave some sources unindexed
         and (idx["method"] or "").lower() == "gin"
         and idx["indnkeyatts"] == 1
+        and (idx["opclasses"] or []) == ["tsvector_ops"]
         and _canon_expr(idx["key1_def"]) == "fts_vector"  # exact column, not a substring
         for idx in indexes
     )
