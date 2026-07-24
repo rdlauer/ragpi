@@ -4,6 +4,7 @@ from testcontainers.postgres import PostgresContainer  # type: ignore
 
 from tests.integration.halfvec_bench_utils import (
     TABLE,
+    build_vector_index,
     create_bench_table,
     generate_corpus,
     generate_queries,
@@ -26,6 +27,7 @@ def test_default_config_meets_recall_threshold(postgres_container: PostgresConta
         corpus = generate_corpus({"big": 500, "medium": 200}, seed=7)
         create_bench_table(url)
         insert_corpus(url, corpus)
+        build_vector_index(url)
         queries = generate_queries(corpus, seed=8, per_source=20)
 
         result = measure_config(

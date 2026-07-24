@@ -197,8 +197,9 @@ class ChatService:
             elif message.content:
                 return ChatResponse(message=message.content)
             else:
-                raise ValueError(
-                    "No response content or tool call found in completion."
+                # ChatException (not a raw error) so this maps to a clean 400, not a 500.
+                raise ChatException(
+                    "The model returned no content or tool call."
                 )
 
         return ChatResponse(
@@ -258,10 +259,32 @@ class ChatService:
                     )
                 continue
 
+            # No tool calls: a normal answer, a safeguard refusal, an incomplete
+            # response (e.g. token exhaustion), or genuinely empty output. Map the
+            # non-answer cases to ChatException (clean 400) rather than a raw 500.
             if response.output_text:
                 return ChatResponse(message=response.output_text)
-            raise ValueError("No response content or tool call found in response.")
+            refusal = self._extract_refusal(response)
+            if refusal:
+                return ChatResponse(message=refusal)
+            if getattr(response, "status", None) == "incomplete":
+                details = getattr(response, "incomplete_details", None)
+                reason = getattr(details, "reason", None) or "unknown"
+                raise ChatException(
+                    f"The model could not complete the response (incomplete: {reason})."
+                )
+            raise ChatException("The model returned no answer content.")
 
         return ChatResponse(
             message="I'm sorry, but I don't have the information you're looking for."
         )
+
+    @staticmethod
+    def _extract_refusal(response: Any) -> str | None:
+        """Return the refusal text if the model declined the request, else None."""
+        for item in response.output:
+            if getattr(item, "type", None) == "message":
+                for block in getattr(item, "content", None) or []:
+                    if getattr(block, "type", None) == "refusal":
+                        return getattr(block, "refusal", None)
+        return None

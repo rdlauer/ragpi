@@ -442,14 +442,16 @@ def test_flat_tool_schema_does_not_mutate_chat_tools(
     assert "function" in dict(responses_chat_service.tools[0])
 
 
-def test_reasoning_model_error_maps_to_actionable_message(
-    responses_chat_service: ChatService,
+def test_reasoning_model_error_on_chat_path_maps_to_actionable_message(
+    chat_service: ChatService,
     mock_openai_client: OpenAI,
     sample_chat_input: CreateChatRequest,
     mocker: MockerFixture,
 ) -> None:
+    # The production case: the DEFAULT Chat Completions path (Responses OFF) rejects
+    # function tools + active reasoning, and we guide the operator to enable Responses.
     mocker.patch.object(
-        mock_openai_client.responses,
+        mock_openai_client.chat.completions,
         "create",
         side_effect=APIError(
             request=mocker.Mock(),
@@ -463,7 +465,7 @@ def test_reasoning_model_error_maps_to_actionable_message(
     )
 
     with pytest.raises(KnownException, match="Responses API"):
-        responses_chat_service.generate_response(sample_chat_input)
+        chat_service.generate_response(sample_chat_input)
 
 
 def test_reasoning_effort_ignored_when_responses_disabled(
@@ -504,3 +506,62 @@ def test_reasoning_effort_ignored_when_responses_disabled(
     # reasoning_effort must not leak into the Chat Completions request.
     assert "reasoning" not in create.call_args.kwargs
     assert "reasoning_effort" not in create.call_args.kwargs
+
+
+def test_responses_refusal_is_returned_as_message(
+    responses_chat_service: ChatService,
+    mock_openai_client: OpenAI,
+    sample_chat_input: CreateChatRequest,
+    mocker: MockerFixture,
+) -> None:
+    refusal_block = SimpleNamespace(type="refusal", refusal="I can't help with that.")
+    message_item = SimpleNamespace(type="message", content=[refusal_block])
+    mocker.patch.object(
+        mock_openai_client.responses,
+        "create",
+        return_value=SimpleNamespace(output=[message_item], output_text="", id="r1"),
+    )
+
+    response = responses_chat_service.generate_response(sample_chat_input)
+
+    assert response.message == "I can't help with that."
+
+
+def test_responses_incomplete_maps_to_known_exception(
+    responses_chat_service: ChatService,
+    mock_openai_client: OpenAI,
+    sample_chat_input: CreateChatRequest,
+    mocker: MockerFixture,
+) -> None:
+    mocker.patch.object(
+        mock_openai_client.responses,
+        "create",
+        return_value=SimpleNamespace(
+            output=[],
+            output_text="",
+            id="r1",
+            status="incomplete",
+            incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+        ),
+    )
+
+    with pytest.raises(KnownException, match="incomplete: max_output_tokens"):
+        responses_chat_service.generate_response(sample_chat_input)
+
+
+def test_responses_empty_output_maps_to_known_exception(
+    responses_chat_service: ChatService,
+    mock_openai_client: OpenAI,
+    sample_chat_input: CreateChatRequest,
+    mocker: MockerFixture,
+) -> None:
+    mocker.patch.object(
+        mock_openai_client.responses,
+        "create",
+        return_value=SimpleNamespace(
+            output=[], output_text="", id="r1", status="completed"
+        ),
+    )
+
+    with pytest.raises(KnownException, match="no answer content"):
+        responses_chat_service.generate_response(sample_chat_input)
