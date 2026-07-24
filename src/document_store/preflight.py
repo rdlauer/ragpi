@@ -21,7 +21,10 @@ import hashlib
 import json
 import logging
 import re
+import secrets
 import time
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 from sqlalchemy import Engine, create_engine, text
 
@@ -44,6 +47,12 @@ logger = logging.getLogger(__name__)
 MIN_PGVECTOR_FOR_LARGE = (0, 8, 0)
 MANIFEST_TABLE = "ragpi_store_manifest"
 PREFLIGHT_LOCK_TIMEOUT_S = 30.0
+REDIS_LOCK_TTL_S = 60
+# Only delete a lock we still own (guards against deleting a replacement's lock).
+_REDIS_UNLOCK_LUA = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) "
+    "else return 0 end"
+)
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _COLTYPE_RE = re.compile(r"^([A-Za-z_]+)\s*(?:\((\d+)\))?$")
@@ -109,7 +118,10 @@ def _endpoint_space_id(settings: Settings) -> str | None:
     return None  # standard OpenAI: provider identity is sufficient
 
 
-def build_configured_manifest(settings: Settings) -> StoreManifest:
+def build_configured_manifest(
+    settings: Settings, backend: str | None = None
+) -> StoreManifest:
+    backend = backend or settings.DOCUMENT_STORE_BACKEND
     dims = settings.EMBEDDING_DIMENSIONS
     identity = EmbeddingIdentity(
         provider=settings.EMBEDDING_PROVIDER.value,
@@ -118,6 +130,18 @@ def build_configured_manifest(settings: Settings) -> StoreManifest:
         distance_metric="cosine",
         space_id=_endpoint_space_id(settings),
     )
+    if backend == "redis":
+        return StoreManifest(
+            MANIFEST_VERSION,
+            identity,
+            StorageSchema(column_type="float32", dimensions=dims),
+            IndexSchema(
+                algorithm="hnsw",
+                opclass="cosine",
+                expression=None,
+                build_params={"datatype": "float32"},
+            ),
+        )
     storage = StorageSchema(column_type="vector", dimensions=dims)
     if dims > 2000:
         index = IndexSchema(
@@ -137,17 +161,23 @@ def build_configured_manifest(settings: Settings) -> StoreManifest:
 
 
 def _is_legacy_default(m: StoreManifest) -> bool:
-    """True if the config matches the historical pre-manifest defaults, so an
-    unmarked existing store can be safely assumed to match it."""
+    """True if the embedding identity matches the historical pre-manifest defaults,
+    so an unmarked existing store can be safely assumed to match it. Checks identity
+    only (model/dims/provider) — the backend-specific storage/index representation is
+    implied by the identity and validated separately."""
     ei = m.embedding_identity
     return (
         ei.provider == "openai"
         and ei.model == "text-embedding-3-small"
         and ei.dimensions == 1536
         and ei.space_id is None
-        and m.storage_schema.column_type == "vector"
-        and m.index_schema.algorithm == "ivfflat"
     )
+
+
+def _fingerprint(manifest: StoreManifest) -> str:
+    return hashlib.sha256(
+        json.dumps(manifest.to_dict(), sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 # --------------------------------------------------------------------------- #
@@ -346,11 +376,132 @@ def _pg_preflight(engine: Engine, settings: Settings) -> None:
             _create_fresh(conn, configured, namespace, dims)
 
 
+# --------------------------------------------------------------------------- #
+# Redis preflight                                                             #
+# --------------------------------------------------------------------------- #
+@contextmanager
+def _redis_lock(client: Any, key: str) -> Iterator[str]:
+    """Short-lived distributed lock: SET NX EX with a unique token, released via a
+    compare-and-delete Lua script so we never delete a replacement process's lock."""
+    token = secrets.token_hex(16)
+    deadline = time.monotonic() + PREFLIGHT_LOCK_TIMEOUT_S
+    while not client.set(key, token, nx=True, ex=REDIS_LOCK_TTL_S):
+        if time.monotonic() >= deadline:
+            raise PreflightError(
+                f"Timed out acquiring the Redis document-store startup lock ({key}); "
+                "another process may be initializing the store."
+            )
+        time.sleep(0.5)
+    try:
+        yield token
+    finally:
+        try:
+            client.eval(_REDIS_UNLOCK_LUA, 1, key, token)
+        except Exception:  # pragma: no cover - best-effort release
+            logger.warning("Failed to release Redis preflight lock %s", key)
+
+
+def _canon(value: Any) -> str:
+    return str(getattr(value, "value", value)).lower()
+
+
+def _adopt_legacy_redis(
+    client: Any, settings: Settings, configured: StoreManifest, name: str
+) -> None:
+    from redisvl.index import SearchIndex  # type: ignore
+
+    existing = SearchIndex.from_existing(name, redis_client=client)
+    attrs = existing.schema.fields["embedding"].attrs
+    existing_dims = int(getattr(attrs, "dims"))
+    if existing_dims != configured.storage_schema.dimensions:
+        raise PreflightError(
+            f"Existing Redis index '{name}' has embedding dims {existing_dims}, but the "
+            f"configuration expects {configured.storage_schema.dimensions} "
+            f"(EMBEDDING_MODEL={settings.EMBEDDING_MODEL}). Changing embedding dimensions "
+            "requires dropping the index and its keys and re-embedding all sources."
+        )
+    existing_schema = (
+        _canon(getattr(attrs, "datatype", "float32")),
+        _canon(getattr(attrs, "distance_metric", "cosine")),
+        _canon(getattr(attrs, "algorithm", "hnsw")),
+    )
+    if existing_schema != ("float32", "cosine", "hnsw"):
+        raise PreflightError(
+            f"Existing Redis index '{name}' vector schema {existing_schema} is incompatible "
+            "with the configured float32/cosine/hnsw; drop the index and its keys and re-embed."
+        )
+    if _is_legacy_default(configured) or settings.EMBEDDING_ADOPT_EXISTING:
+        client.set(f"{name}:__manifest__", json.dumps(configured.to_dict()))
+        logger.info("Adopted existing Redis document store '%s' and wrote its manifest.", name)
+    else:
+        raise PreflightError(
+            f"Existing Redis index '{name}' has no manifest, and the configured embedding "
+            f"({configured.embedding_identity.model}, "
+            f"dims={configured.embedding_identity.dimensions}) is not the legacy default, so "
+            "the embedding space cannot be verified. If you are certain the existing vectors "
+            "match this configuration, set EMBEDDING_ADOPT_EXISTING=true; otherwise drop the "
+            "index and its keys and re-embed."
+        )
+
+
+def _redis_preflight(client: Any, settings: Settings) -> None:
+    from redisvl.index import SearchIndex  # type: ignore
+
+    from src.document_store.redis.store import build_index_schema
+
+    configured = build_configured_manifest(settings, backend="redis")
+    name = _validate_ident(settings.DOCUMENT_STORE_NAMESPACE)
+    dims = settings.EMBEDDING_DIMENSIONS
+    manifest_key = f"{name}:__manifest__"
+    marker_key = f"{name}:__init__"
+    lock_key = f"{name}:__preflight_lock__"
+    fingerprint = _fingerprint(configured)
+
+    with _redis_lock(client, lock_key):
+        index = SearchIndex(build_index_schema(name, dims), redis_client=client)
+
+        existing_raw = client.get(manifest_key)
+        if existing_raw:
+            comparison = compare_manifests(
+                configured, StoreManifest.from_dict(json.loads(existing_raw))
+            )
+            if not comparison.compatible:
+                raise PreflightError(comparison.message)
+            client.delete(marker_key)  # clear any stale init marker
+            logger.info("Redis document store '%s' is compatible with its manifest.", name)
+            return
+
+        if index.exists():
+            marker_raw = client.get(marker_key)
+            if marker_raw:
+                if json.loads(marker_raw).get("fingerprint") == fingerprint:
+                    # Interrupted init for THIS config (index created, manifest not
+                    # written): safe to resume.
+                    client.set(manifest_key, json.dumps(configured.to_dict()))
+                    client.delete(marker_key)
+                    logger.info("Resumed interrupted Redis index init for '%s'.", name)
+                    return
+                raise PreflightError(
+                    f"Redis index '{name}' carries an initialization marker for a different "
+                    "configuration (an interrupted init). Drop the index and its keys, then re-embed."
+                )
+            _adopt_legacy_redis(client, settings, configured, name)
+            return
+
+        # Fresh: init-marker protocol makes a crash between create and manifest-write
+        # recoverable (and an unmarked index is never silently adopted).
+        client.set(marker_key, json.dumps({"fingerprint": fingerprint}))
+        index.create()
+        client.set(manifest_key, json.dumps(configured.to_dict()))
+        client.delete(marker_key)
+        logger.info("Created fresh Redis document store '%s' and wrote its manifest.", name)
+
+
 def run_preflight(settings: Settings) -> None:
     """Entry point for API lifespan and Celery worker startup.
 
-    Uses a dedicated, short-lived engine that is disposed before returning, so a
-    Celery parent never leaves pooled connections to be inherited across prefork.
+    Uses dedicated, short-lived resources (a disposed engine / a closed Redis client)
+    so a Celery parent never leaves pooled connections to be inherited across prefork.
     """
     if settings.DOCUMENT_STORE_BACKEND == "postgres":
         engine = create_engine(settings.POSTGRES_URL, pool_pre_ping=True)
@@ -358,10 +509,15 @@ def run_preflight(settings: Settings) -> None:
             _pg_preflight(engine, settings)
         finally:
             engine.dispose()
+    elif settings.DOCUMENT_STORE_BACKEND == "redis":
+        from src.common.redis import create_redis_client
+
+        client = create_redis_client(settings.REDIS_URL)
+        try:
+            _redis_preflight(client, settings)
+        finally:
+            client.close()
     else:
-        # Redis preflight is added in a following slice; the Redis store still
-        # self-initializes its index for now (existing behavior preserved).
-        logger.info(
-            "Document-store preflight for backend '%s' not yet implemented; skipping.",
-            settings.DOCUMENT_STORE_BACKEND,
+        raise PreflightError(
+            f"Unsupported document store backend: {settings.DOCUMENT_STORE_BACKEND}"
         )

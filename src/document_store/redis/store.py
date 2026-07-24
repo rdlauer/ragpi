@@ -19,6 +19,17 @@ from src.document_store.redis.fields import (
 from src.document_store.ranking import reciprocal_rank_fusion
 
 
+def build_index_schema(index_name: str, embedding_dimensions: int) -> IndexSchema:
+    """Build the redisvl index schema for a document store. Shared by the store
+    (client-side handle) and the preflight (server-side index creation)."""
+    return IndexSchema.from_dict(
+        {
+            "index": {"name": index_name, "prefix": f"{index_name}:sources"},
+            **get_index_schema_fields(embedding_dimensions),
+        }
+    )
+
+
 class RedisDocumentStore(DocumentStoreBackend):
     def __init__(
         self,
@@ -39,15 +50,12 @@ class RedisDocumentStore(DocumentStoreBackend):
         self.document_fields = DOCUMENT_FIELDS
         self.index_name = index_name
         self.index_prefix = f"{self.index_name}:sources"
-        index_schema = IndexSchema.from_dict(
-            {
-                "index": {"name": self.index_name, "prefix": self.index_prefix},
-                **self.index_schema_fields,
-            }
+        self.index = SearchIndex(
+            build_index_schema(self.index_name, self.embedding_dimensions),
+            redis_client=self.client,
         )
-        self.index = SearchIndex(index_schema, redis_client=self.client)
-        if not self.index.exists():
-            self.index.create()
+        # Index creation/validation is handled once at startup by the document-store
+        # preflight (src/document_store/preflight.py), not per-request here.
 
     def _get_source_key(self, source_name: str) -> str:
         return f"{self.index_prefix}:{source_name}"
