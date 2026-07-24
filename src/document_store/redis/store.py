@@ -45,7 +45,7 @@ class RedisDocumentStore(DocumentStoreBackend):
                 **self.index_schema_fields,
             }
         )
-        self.index = SearchIndex(index_schema).set_client(self.client)  # type: ignore
+        self.index = SearchIndex(index_schema, redis_client=self.client)
         if not self.index.exists():
             self.index.create()
 
@@ -108,10 +108,7 @@ class RedisDocumentStore(DocumentStoreBackend):
         pipeline = self.client.pipeline()
 
         for key in keys:
-            pipeline.hmget(
-                key,
-                *self.document_fields,
-            )
+            pipeline.hmget(key, self.document_fields)
 
         results = pipeline.execute()
 

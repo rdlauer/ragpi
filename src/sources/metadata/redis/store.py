@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import TypedDict
+from typing import TypedDict, cast
 
 from src.connectors.registry import ConnectorConfig
 from src.common.redis import RedisClient
@@ -79,7 +79,7 @@ class RedisMetadataStore(SourceMetadataStore):
 
     def get_metadata(self, source_name: str) -> SourceMetadata:
         metadata_key = self._get_metadata_key(source_name)
-        metadata = self.client.hgetall(metadata_key)
+        metadata = cast("dict[str, str]", self.client.hgetall(metadata_key))
         connector_config = deserialize_connector_config(metadata["connector"])
 
         return SourceMetadata(
@@ -98,7 +98,7 @@ class RedisMetadataStore(SourceMetadataStore):
         self.client.delete(metadata_key)
 
     def list_metadata(self) -> list[SourceMetadata]:
-        metadata_keys = self.client.keys(f"{self.key_prefix}:*")
+        metadata_keys = cast("list[str]", self.client.keys(f"{self.key_prefix}:*"))
         metadata: list[SourceMetadata] = []
         for key in metadata_keys:
             source_name = key.split(":")[1]

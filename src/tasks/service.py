@@ -1,5 +1,5 @@
 import json
-from typing import Any
+from typing import Any, cast
 
 from celery import Celery
 
@@ -28,13 +28,13 @@ class TaskService:
         ]
         tasks: list[Task] = []
         for key in keys:
-            task = self.redis_client.get(key)
+            task = cast("str | None", self.redis_client.get(key))
             if task:
                 tasks.append(self._map_task(json.loads(task)))
         return tasks
 
     def get_task(self, task_id: str) -> Task:
-        task = self.redis_client.get(f"{self.key_prefix}{task_id}")
+        task = cast("str | None", self.redis_client.get(f"{self.key_prefix}{task_id}"))
         if not task:
             raise ResourceNotFoundException(ResourceType.TASK, task_id)
         return self._map_task(json.loads(task))

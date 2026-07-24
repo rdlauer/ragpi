@@ -1,13 +1,15 @@
 from datetime import datetime
 from sqlalchemy import String, Integer, Text, DateTime
-from sqlalchemy.orm import declarative_base, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from src.config import get_settings
 
 
 settings = get_settings()
 
-Base = declarative_base()
+
+class Base(DeclarativeBase):
+    pass
 
 
 class SourceMetadataModel(Base):

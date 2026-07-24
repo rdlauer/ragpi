@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 from sqlalchemy import Computed, DateTime, String, Index
-from sqlalchemy.orm import declarative_base, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from pgvector.sqlalchemy import Vector  # type: ignore
 from sqlalchemy_utils import TSVectorType  # type: ignore
 
@@ -10,7 +10,9 @@ from src.config import get_settings  # type: ignore
 
 settings = get_settings()
 
-Base = declarative_base()
+
+class Base(DeclarativeBase):
+    pass
 
 
 class DocumentStoreModel(Base):
