@@ -89,7 +89,7 @@ only available when `CHAT_PROVIDER=openai`:
 CHAT_PROVIDER=openai
 DEFAULT_CHAT_MODEL=gpt-5.6-sol
 CHAT_USE_RESPONSES_API=true
-REASONING_EFFORT=medium        # none | minimal | low | medium | high | xhigh | max (optional)
+REASONING_EFFORT=medium        # gpt-5.6: none|low|medium|high|xhigh|max (optional)
 ```
 
 When `CHAT_USE_RESPONSES_API` is off (the default), all providers use the Chat Completions
@@ -114,9 +114,9 @@ On Postgres, embeddings are always stored as full-precision float32. Above 2000 
 (pgvector's approximate-index limit for the `vector` type) Ragpi automatically indexes a
 half-precision (`halfvec`) expression with HNSW and reranks candidates by exact float32
 cosine — full-precision ranking with scalable search. This requires the **pgvector server
-extension ≥ 0.8.0**; the bundled `pgvector/pgvector:pg17` image satisfies it. Redis needs no
-change. Retrieval over-fetch is tunable via `EMBEDDING_CANDIDATE_MULTIPLIER` (default 10) and
-`HNSW_EF_SEARCH`.
+extension ≥ 0.8.2** (0.8.2 fixed a buffer overflow in parallel HNSW index builds); the
+bundled `pgvector/pgvector:pg17` image satisfies it. Redis needs no change. Retrieval
+over-fetch is tunable via `EMBEDDING_CANDIDATE_MULTIPLIER` (default 10) and `HNSW_EF_SEARCH`.
 
 Ragpi records a manifest for each store (embedding provider/model/dimensions, storage and
 index schema). At startup it validates the configured settings against the manifest and
@@ -142,7 +142,7 @@ documents. There is no automatic data migration. Do **not** use `docker compose 
 6. Verify document counts and semantic-search results.
 
 If a persistent store is left un-migrated after a dimension/model change, startup fails with
-guidance rather than corrupting data. For an existing pre-0.8.0 pgvector extension on the
+guidance rather than corrupting data. For an existing pre-0.8.2 pgvector extension on the
 large path, set `PG_UPDATE_VECTOR_EXTENSION=true` to run `ALTER EXTENSION vector UPDATE` at
 startup — note this upgrades the extension for the **entire** database, so back up and
 revalidate other pgvector-dependent applications first.

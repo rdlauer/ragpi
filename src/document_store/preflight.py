@@ -43,9 +43,10 @@ from src.llm_providers.constants import EmbeddingProvider
 
 logger = logging.getLogger(__name__)
 
-# iterative_scan (needed for the filtered halfvec query path) was added in 0.8.0;
-# halfvec itself is 0.7.0, but the >2000-dim query path depends on 0.8.0.
-MIN_PGVECTOR_FOR_LARGE = (0, 8, 0)
+# The >2000-dim path needs halfvec (0.7.0) + iterative_scan (0.8.0), but requires
+# 0.8.2: it fixed a buffer overflow in *parallel* HNSW index construction, and we
+# build the HNSW index with parallel maintenance workers enabled.
+MIN_PGVECTOR_FOR_LARGE = (0, 8, 2)
 MANIFEST_TABLE = "ragpi_store_manifest"
 PREFLIGHT_LOCK_TIMEOUT_S = 30.0
 REDIS_LOCK_TTL_S = 60
@@ -267,16 +268,18 @@ def _ensure_extension_version(conn, settings: Settings, dims: int) -> None:
         if parse_version(version) < MIN_PGVECTOR_FOR_LARGE:
             raise PreflightError(
                 f"pgvector is still {version} after ALTER EXTENSION UPDATE, below the "
-                "0.8.0 required for the >2000-dim index path. Upgrade the Postgres image/server."
+                "0.8.2 required for the >2000-dim index path. Upgrade the Postgres image/server "
+                "(the pgvector/pgvector:pg17 image ships >= 0.8.2)."
             )
     else:
         raise PreflightError(
-            f"EMBEDDING_DIMENSIONS={dims} (>2000) requires the pgvector server extension >= 0.8.0 "
-            f"(half-precision index + iterative scans), but the database reports {version!r}. "
-            "Updating the Docker image/package does NOT upgrade an extension in an existing "
-            "database. Set PG_UPDATE_VECTOR_EXTENSION=true to run 'ALTER EXTENSION vector UPDATE' "
-            "at startup — note this upgrades the extension for the WHOLE database: back it up, "
-            "check other pgvector-dependent apps, and revalidate them afterward."
+            f"EMBEDDING_DIMENSIONS={dims} (>2000) requires the pgvector server extension >= 0.8.2 "
+            "(half-precision index + iterative scans, and the 0.8.2 fix for a buffer overflow in "
+            f"parallel HNSW index builds), but the database reports {version!r}. Updating the "
+            "Docker image/package does NOT upgrade an extension in an existing database. Set "
+            "PG_UPDATE_VECTOR_EXTENSION=true to run 'ALTER EXTENSION vector UPDATE' at startup — "
+            "note this upgrades the extension for the WHOLE database: back it up, check other "
+            "pgvector-dependent apps, and revalidate them afterward."
         )
 
 

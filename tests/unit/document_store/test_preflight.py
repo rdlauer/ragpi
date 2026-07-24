@@ -144,8 +144,9 @@ class TestEnsureExtensionVersion:
         _ensure_extension_version(conn, _settings(), dims=1536)
 
     def test_large_dims_old_version_without_flag_raises(self):
-        conn = _FakeConn(["0.7.4"])
-        with pytest.raises(PreflightError, match="0.8.0"):
+        # 0.8.1 has halfvec + iterative_scan but not the 0.8.2 parallel-HNSW-build fix.
+        conn = _FakeConn(["0.8.1"])
+        with pytest.raises(PreflightError, match="0.8.2"):
             _ensure_extension_version(
                 conn,
                 _settings(EMBEDDING_MODEL="text-embedding-3-large", EMBEDDING_DIMENSIONS=3072),
@@ -161,7 +162,7 @@ class TestEnsureExtensionVersion:
         )
 
     def test_large_dims_updates_when_authorized(self):
-        conn = _FakeConn(["0.7.4", "0.8.2"])  # before + after ALTER
+        conn = _FakeConn(["0.8.1", "0.8.5"])  # before + after ALTER
         _ensure_extension_version(
             conn,
             _settings(
