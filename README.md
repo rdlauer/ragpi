@@ -111,12 +111,19 @@ EMBEDDING_DIMENSIONS=3072
 ```
 
 On Postgres, embeddings are always stored as full-precision float32. Above 2000 dimensions
-(pgvector's approximate-index limit for the `vector` type) Ragpi automatically indexes a
-half-precision (`halfvec`) expression with HNSW and reranks candidates by exact float32
-cosine — full-precision ranking with scalable search. This requires the **pgvector server
-extension ≥ 0.8.2** (0.8.2 fixed a buffer overflow in parallel HNSW index builds); the
-bundled `pgvector/pgvector:pg17` image satisfies it. Redis needs no change. Retrieval
-over-fetch is tunable via `EMBEDDING_CANDIDATE_MULTIPLIER` (default 10) and `HNSW_EF_SEARCH`.
+(pgvector's approximate-index limit for the `vector` type) Ragpi builds a half-precision
+(`halfvec`) HNSW expression index and queries in two stages — approximate candidates, then
+an exact float32 rerank. This requires the **pgvector server extension ≥ 0.8.2** (0.8.2
+fixed a buffer overflow in parallel HNSW index builds); the bundled
+`pgvector/pgvector:pg17` image satisfies it. Redis needs no change.
+
+Note that Postgres chooses the access path per query: for small and medium sources it
+typically serves the candidate stage with an **exact scan** of the filtered source (which
+is both fast and perfectly accurate at that scale — measured ~25 ms/query even for a
+50k-document source) and switches to the HNSW index only when a source grows large enough
+for it to win on cost.
+Retrieval over-fetch is tunable via `EMBEDDING_CANDIDATE_MULTIPLIER` (default 10) and
+`HNSW_EF_SEARCH`; these only affect queries served by the index.
 
 Ragpi records a manifest for each store (embedding provider/model/dimensions, storage and
 index schema). At startup it validates the configured settings against the manifest and

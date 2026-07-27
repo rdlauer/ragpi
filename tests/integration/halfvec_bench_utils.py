@@ -194,6 +194,22 @@ def _make_store(
     return store
 
 
+def hnsw_index_scans(engine: Engine) -> int:
+    """Cumulative scan count for the benchmark's HNSW index (pg_stat_user_indexes).
+    Only real index scans increment it, so a delta of 0 across queries means the
+    planner served them with exact scans instead of the ANN index."""
+    with engine.connect() as conn:
+        return int(
+            conn.execute(
+                text(
+                    "SELECT COALESCE(idx_scan, 0) FROM pg_stat_user_indexes "
+                    f"WHERE indexrelname = '{TABLE}_embedding_halfvec_idx'"
+                )
+            ).scalar()
+            or 0
+        )
+
+
 def measure_config(
     engine: Engine,
     corpus: dict[str, list[tuple[str, Any]]],
@@ -204,8 +220,12 @@ def measure_config(
     ef_search: int | None,
 ) -> dict[str, Any]:
     """Run every query through the store and compute recall vs exhaustive float32
-    and query latency. Returns aggregate + per-source recall and p50/p95 latency."""
+    and query latency. Also reports whether the HNSW index actually served the
+    candidate queries ("ann_used") — at small corpus sizes Postgres prefers an exact
+    scan (which trivially yields perfect recall), so recall/ef_search numbers are only
+    meaningful ANN measurements when ann_used is True."""
     store = _make_store(engine, [q for _, q in queries], multiplier, ef_search)
+    scans_before = hnsw_index_scans(engine)
     latencies: list[float] = []
     recalls: list[float] = []
     per_source: dict[str, list[float]] = {}
@@ -217,6 +237,8 @@ def measure_config(
         r = recall_at_k([d.id for d in results], truth)
         recalls.append(r)
         per_source.setdefault(source, []).append(r)
+    time.sleep(1.0)  # cumulative stats flush lag
+    hnsw_scans = hnsw_index_scans(engine) - scans_before
     lat = sorted(latencies)
     return {
         "multiplier": multiplier,
@@ -225,6 +247,8 @@ def measure_config(
         "recall_worst_source": min(float(np.mean(v)) for v in per_source.values()),
         "p50_ms": lat[len(lat) // 2],
         "p95_ms": lat[min(len(lat) - 1, int(len(lat) * 0.95))],
+        "hnsw_scans": hnsw_scans,
+        "ann_used": hnsw_scans > 0,
     }
 
 
@@ -246,7 +270,16 @@ def run_sweep(
     Caveats for qualifying production defaults: this uses SYNTHETIC clustered vectors,
     not real embeddings; scale `source_sizes` up (defaults are modest) and, ideally,
     feed a corpus embedded with the real target model before certifying a multiplier.
-    It also does not compare latency against the <=2000 direct-cosine path."""
+    It also does not compare latency against the <=2000 direct-cosine path.
+
+    IMPORTANT — read the `ann` column: Postgres chooses per query between the HNSW
+    index and an exact scan of the filtered source, and at small/medium corpus sizes it
+    prefers the exact scan (top-N sort of a few thousand rows costs less than an index
+    walk). Exact scans yield perfect recall by definition, so rows with ann=no measure
+    the adaptive exact path, NOT ANN quality — ef_search/multiplier tuning is only
+    meaningful on rows with ann=yes. Empirically (Apple M-series, pgvector 0.8.5) the
+    planner still chose exact scans at a 50k-row source (~26 ms/query, 3072 dims);
+    scale source_sizes well beyond that to benchmark true ANN behavior."""
     source_sizes = source_sizes or {"big": 2000, "medium": 800, "small": 150}
     top_k = 10
     corpus = generate_corpus(source_sizes, seed=seed)
@@ -266,7 +299,9 @@ def run_sweep(
         f"insert={insert_s:.1f}s ({n_docs / insert_s:,.0f} docs/s), "
         f"hnsw build={build_s:.1f}s, index={index_mb:.1f} MB"
     )
-    print(f"{'mult':>5} {'ef':>6} {'recall':>8} {'worst':>8} {'p50 ms':>9} {'p95 ms':>9}")
+    print(
+        f"{'mult':>5} {'ef':>6} {'recall':>8} {'worst':>8} {'p50 ms':>9} {'p95 ms':>9} {'ann':>5}"
+    )
 
     results: list[dict[str, Any]] = []
     for multiplier in (1, 2, 5, 10):
@@ -276,9 +311,11 @@ def run_sweep(
             )
             results.append(m)
             ef_label = "auto" if ef_search is None else str(ef_search)
+            ann_label = "yes" if m["ann_used"] else "no"
             print(
                 f"{multiplier:>5} {ef_label:>6} {m['recall_mean']:>8.4f} "
-                f"{m['recall_worst_source']:>8.4f} {m['p50_ms']:>9.2f} {m['p95_ms']:>9.2f}"
+                f"{m['recall_worst_source']:>8.4f} {m['p50_ms']:>9.2f} {m['p95_ms']:>9.2f} "
+                f"{ann_label:>5}"
             )
 
     def _passes(r: dict[str, Any]) -> bool:
@@ -288,13 +325,20 @@ def run_sweep(
 
     passing = [r for r in results if _passes(r)]
     budget = "n/a" if p95_budget_ms is None else f"{p95_budget_ms:.0f} ms"
+    if not any(r["ann_used"] for r in results):
+        print(
+            "\nNOTE: no configuration used the HNSW index — the planner served every query "
+            "with an exact scan at this corpus size (adaptive behavior; recall is trivially "
+            "high). Increase source_sizes to benchmark true ANN recall/latency."
+        )
     if passing:
         best = min(passing, key=lambda r: (r["multiplier"], r["ef_search"] or 0))
         ef_label = "auto" if best["ef_search"] is None else best["ef_search"]
+        qualifier = "" if best["ann_used"] else " [exact-scan regime — not an ANN measurement]"
         print(
             f"\nRecommended smallest config (recall_worst >= {recall_threshold}, p95 <= {budget}): "
             f"multiplier={best['multiplier']}, ef_search={ef_label} "
-            f"(recall_mean={best['recall_mean']:.4f}, p95={best['p95_ms']:.2f} ms)"
+            f"(recall_mean={best['recall_mean']:.4f}, p95={best['p95_ms']:.2f} ms){qualifier}"
         )
     else:
         print(

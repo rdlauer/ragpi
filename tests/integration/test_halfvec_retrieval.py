@@ -1,4 +1,5 @@
 import math
+import time
 from datetime import datetime, timezone
 from typing import Any, Generator
 from unittest.mock import Mock
@@ -149,3 +150,68 @@ def test_halfvec_expression_index_is_used_with_seqscan_off(populated: dict) -> N
             ).fetchall()
         )
     assert f"{TABLE}_embedding_halfvec_idx" in plan, plan
+
+
+def test_source_filtered_candidate_query_is_index_eligible(populated: dict) -> None:
+    # The production candidate query carries a `WHERE source = ...` filter, which gives
+    # the planner alternative paths (source btree / seq scan + top-N sort). This proves
+    # the HNSW index can still serve the FILTERED ordering when those rivals are
+    # disabled — i.e. the shipped query shape is index-eligible, so the planner can
+    # switch to it when a source grows large enough for the index to win on cost.
+    query_vec = _vec(0.55)
+    q = "[" + ",".join(str(x) for x in query_vec) + "]"
+    engine = populated["engine"]
+    with engine.connect() as conn:
+        conn.execute(text("SELECT '[1]'::vector"))
+        conn.execute(text("SET LOCAL enable_seqscan = off"))
+        conn.execute(text("SET LOCAL enable_bitmapscan = off"))
+        conn.execute(text("SET LOCAL enable_sort = off"))
+        conn.execute(text("SET LOCAL hnsw.ef_search = 30"))
+        plan = "\n".join(
+            r[0]
+            for r in conn.execute(
+                text(
+                    f"EXPLAIN SELECT id FROM {TABLE} WHERE source = 's1' "
+                    f"ORDER BY embedding::halfvec({DIMS}) <=> CAST(:q AS halfvec({DIMS})) "
+                    "LIMIT 30"
+                ),
+                {"q": q},
+            ).fetchall()
+        )
+    assert f"{TABLE}_embedding_halfvec_idx" in plan, plan
+    assert "Filter" in plan, plan  # source predicate applied during the index scan
+
+
+def test_small_source_semantic_search_uses_adaptive_exact_scan(populated: dict) -> None:
+    # Documents the intended ADAPTIVE behavior at small scale: Postgres serves the
+    # filtered candidate stage with an exact scan (perfectly accurate, cheap for small
+    # sources) rather than the HNSW index, switching to the index only when a source is
+    # large enough for it to win on cost. If this assertion ever fails, the planner's
+    # choice changed (e.g. new pgvector/Postgres cost model) — re-run the benchmark
+    # (scripts/benchmark_halfvec_retrieval.py) and update the README's description of
+    # the adaptive behavior before adjusting the test.
+    engine = populated["engine"]
+    with engine.begin() as conn:
+        conn.execute(text(f"ANALYZE {TABLE}"))
+
+    def hnsw_scans() -> int:
+        with engine.connect() as conn:
+            return int(
+                conn.execute(
+                    text(
+                        "SELECT COALESCE(idx_scan, 0) FROM pg_stat_user_indexes "
+                        f"WHERE indexrelname = '{TABLE}_embedding_halfvec_idx'"
+                    )
+                ).scalar()
+                or 0
+            )
+
+    before = hnsw_scans()
+    store = _store(engine, _vec(0.55))
+    results = store.semantic_search("s1", "irrelevant-mocked", top_k=3)
+    assert len(results) == 3  # correct results either way (exact scan is exact)
+    time.sleep(1.0)  # cumulative stats flush lag
+    assert hnsw_scans() == before, (
+        "Planner behavior changed: the HNSW index served a small-source query that was "
+        "previously handled by the adaptive exact scan. See docstring before updating."
+    )

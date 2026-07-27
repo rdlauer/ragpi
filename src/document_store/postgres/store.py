@@ -139,10 +139,15 @@ class PostgresDocumentStore(DocumentStoreBackend):
     def _semantic_search_halfvec(
         self, source_name: str, query_embedding: list[float], top_k: int
     ) -> list[Document]:
-        """Two-stage retrieval for >2000-dim embeddings: fetch candidates via the
-        half-precision (halfvec) HNSW expression index, then rerank by exact float32
-        cosine distance over the retained `vector` column. No precision loss in the
-        final ranking; scalable ANN via the index.
+        """Two-stage retrieval for >2000-dim embeddings: fetch candidates ordered by
+        half-precision (halfvec) cosine distance, then rerank by exact float32 cosine
+        over the retained `vector` column — no precision loss in the final ranking.
+
+        The candidate ordering matches the HNSW halfvec expression index, but Postgres
+        chooses the access path per query: for small/medium sources it prefers an exact
+        top-N scan of the filtered source (cheap and perfectly accurate at that scale)
+        and switches to the index as sources grow. The ef_search / iterative_scan
+        settings below only take effect on queries the planner serves via the index.
         """
         Model = self.DocumentModel
         dims = self.embedding_dimensions
