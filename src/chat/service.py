@@ -2,6 +2,7 @@ import copy
 import json
 from typing import Any
 from openai import APIError, OpenAI, pydantic_function_tool
+from pydantic import ValidationError
 from openai.types.chat import (
     ChatCompletionMessageParam,
     ChatCompletionSystemMessageParam,
@@ -106,12 +107,18 @@ class ChatService:
     def _retrieve_documents(self, name: str, arguments: str) -> str:
         """Run the retrieve_documents tool and return its JSON result. Shared by the
         Chat Completions and Responses tool-call loops (only the surrounding message
-        shapes differ)."""
+        shapes differ). A hallucinated tool name or malformed/invalid arguments are
+        degenerate model output, mapped to ChatException (clean 400), not a 500."""
         if name != "retrieve_documents":
-            raise ValueError(f"Unknown tool call: {name}")
+            raise ChatException(f"The model called an unknown tool: {name}")
 
-        args = json.loads(arguments)
-        source_input = RetrieveDocuments(**args)
+        try:
+            args = json.loads(arguments)
+            source_input = RetrieveDocuments(**args)
+        except (json.JSONDecodeError, ValidationError, TypeError) as e:
+            raise ChatException(
+                "The model produced an invalid tool call; please retry the request."
+            ) from e
         documents = self.source_service.search_source(
             source_name=source_input.source_name,
             semantic_query=source_input.semantic_query,
@@ -239,6 +246,16 @@ class ChatService:
                 **kwargs,
             )
 
+            # Check completeness BEFORE processing tool calls: an incomplete response
+            # (e.g. max_output_tokens) can carry a function call with truncated JSON
+            # arguments, which must not reach the tool executor.
+            if getattr(response, "status", None) == "incomplete":
+                details = getattr(response, "incomplete_details", None)
+                reason = getattr(details, "reason", None) or "unknown"
+                raise ChatException(
+                    f"The model could not complete the response (incomplete: {reason})."
+                )
+
             function_calls = [
                 item
                 for item in response.output
@@ -267,12 +284,6 @@ class ChatService:
             refusal = self._extract_refusal(response)
             if refusal:
                 return ChatResponse(message=refusal)
-            if getattr(response, "status", None) == "incomplete":
-                details = getattr(response, "incomplete_details", None)
-                reason = getattr(details, "reason", None) or "unknown"
-                raise ChatException(
-                    f"The model could not complete the response (incomplete: {reason})."
-                )
             raise ChatException("The model returned no answer content.")
 
         return ChatResponse(

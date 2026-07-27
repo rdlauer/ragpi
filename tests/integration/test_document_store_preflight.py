@@ -279,6 +279,46 @@ def test_adopted_legacy_index_name_recorded_and_survives_restart(pg_url: str) ->
     assert _read_manifest(pg_url).index_schema.name == "embedding_idx"  # type: ignore[union-attr]
 
 
+def test_rebuilt_index_without_with_clause_is_accepted(pg_url: str) -> None:
+    # The README's "rebuild the vector index" flow may omit WITH — pgvector's defaults
+    # (lists=100) equal the manifest values, so validation must accept the rebuilt index
+    # rather than loop startup failures on a semantically identical index.
+    settings = _settings(pg_url)
+    run_preflight(settings)
+    _exec(
+        pg_url,
+        f'DROP INDEX "{NS}_embedding_idx"',
+        f'CREATE INDEX "{NS}_embedding_idx" ON "{NS}" '
+        "USING ivfflat (embedding vector_cosine_ops)",  # no WITH clause
+    )
+    run_preflight(settings)  # must pass
+
+
+def test_concurrent_preflights_initialize_exactly_once(pg_url: str) -> None:
+    # Plan-promised coverage: API + worker starting together on a fresh database must
+    # serialize under the startup locks — both succeed, one schema/manifest results.
+    from concurrent.futures import ThreadPoolExecutor
+
+    settings = _settings(pg_url)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(run_preflight, settings) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=60)  # raises if either preflight failed
+
+    manifest = _read_manifest(pg_url)
+    assert manifest == build_configured_manifest(settings)
+    engine = create_engine(pg_url)
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(f"SELECT count(*) FROM {MANIFEST_TABLE} WHERE namespace = :ns"),
+                {"ns": NS},
+            ).scalar()
+    finally:
+        engine.dispose()
+    assert rows == 1
+
+
 def test_resolve_table_oid_is_exact_and_case_sensitive(pg_url: str) -> None:
     # to_regclass() on a bound string case-folds ('MixedCase' -> mixedcase) and cannot
     # parse names like 'customer-docs'; our resolver matches pg_class.relname verbatim.

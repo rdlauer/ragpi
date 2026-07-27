@@ -53,11 +53,14 @@ def normalize_endpoint_origin(base_url: str | None) -> str | None:
     """
     if not base_url:
         return None
+    if "://" not in base_url:
+        # Not a URL — a bare host or host:port ("myhost:11434" would otherwise be
+        # misparsed by urlsplit as scheme "myhost", dropping the port and collapsing
+        # distinct endpoints). Strip any credentials, lowercase, keep the port.
+        token = base_url.strip().rsplit("@", 1)[-1].lower()
+        return token or None
     parts = urlsplit(base_url)
     host = (parts.hostname or "").lower()
-    if not host and not parts.scheme:
-        # Not a URL (e.g. a bare host); return a lowercased, trimmed token.
-        return base_url.strip().lower() or None
     origin = f"{parts.scheme.lower()}://{host}" if parts.scheme else host
     if parts.port is not None:
         origin = f"{origin}:{parts.port}"

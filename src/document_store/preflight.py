@@ -388,6 +388,12 @@ def _reloptions_dict(reloptions: Any) -> dict[str, str]:
     return result
 
 
+# pgvector's server-side defaults for index build params. An index created without a
+# WITH clause stores no reloptions but behaves identically to one built with these
+# values, so validation must treat an omitted option as its default.
+_PGVECTOR_BUILD_PARAM_DEFAULTS = {"lists": "100", "m": "16", "ef_construction": "64"}
+
+
 def _canon_expr(expr: str | None) -> str:
     """Canonicalize an index key definition for comparison: drop whitespace and
     parentheses and lowercase, so pg's '(embedding)::halfvec(3072)' equals the
@@ -415,7 +421,8 @@ def _index_matches_schema(idx: dict[str, Any], index_schema: IndexSchema) -> boo
         return False
     opts = _reloptions_dict(idx["reloptions"])
     for key, value in index_schema.build_params.items():
-        if opts.get(key) != str(value):
+        actual = opts.get(key, _PGVECTOR_BUILD_PARAM_DEFAULTS.get(key))
+        if actual != str(value):
             return False
     return True
 
@@ -548,6 +555,17 @@ def _pg_preflight(engine: Engine, settings: Settings) -> None:
     dims = settings.EMBEDDING_DIMENSIONS
 
     with engine.begin() as conn:
+        # Preflight's lock-then-read protocol assumes each catalog read sees the
+        # latest committed state; pin READ COMMITTED so a server/role-level
+        # repeatable-read default can't hand a waiter a pre-commit snapshot.
+        # (Must be the first statement in the transaction.)
+        conn.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+        # Global lock first (fixed acquisition order → no deadlocks): CREATE
+        # EXTENSION / CREATE TABLE IF NOT EXISTS on the shared manifest table race
+        # across DIFFERENT namespaces sharing one database, and IF NOT EXISTS is not
+        # concurrency-safe at the catalog level. Then the namespace-scoped lock for
+        # this store's own validate/create work. Both are transaction-scoped.
+        _acquire_pg_lock(conn, advisory_lock_key("ragpi", "global_ddl"))
         _acquire_pg_lock(conn, advisory_lock_key("ragpi", "document_store", namespace))
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         _ensure_extension_version(conn, settings, dims)
@@ -678,6 +696,23 @@ def _validate_redis_index(client: Any, configured: StoreManifest, name: str) -> 
         )
 
 
+def _assert_no_stale_documents(client: Any, name: str) -> None:
+    """A fresh index build must not silently adopt leftover document hashes: RediSearch
+    background-indexes any existing keys under the '{name}:sources' prefix, so vectors
+    from a previous embedding configuration would be served with no error, ever. Fail
+    with cleanup guidance instead. (Legacy adoption is different — there the index and
+    its documents are expected to exist together.)"""
+    stale = next(iter(client.scan_iter(match=f"{name}:sources:*", count=100)), None)
+    if stale is not None:
+        raise PreflightError(
+            f"Redis has leftover document keys under '{name}:sources:*' (e.g. {stale!r}) "
+            "but no manifest for them. Creating a fresh index would silently re-index "
+            "vectors from a previous embedding configuration. Delete the "
+            f"'{name}:sources:*' keys and re-sync sources, or restore the original index "
+            "and manifest."
+        )
+
+
 def _adopt_legacy_redis(
     client: Any, settings: Settings, configured: StoreManifest, name: str, token: str
 ) -> None:
@@ -735,7 +770,10 @@ def _redis_preflight(client: Any, settings: Settings) -> None:
                 if json.loads(marker_raw).get("fingerprint") == fingerprint:
                     # Interrupted init for THIS config — validate the actual index before
                     # certifying it (a stale marker must not bless an incompatible index).
+                    # Documents are only written after preflight succeeds, so any keys
+                    # present mid-init are leftovers from a previous configuration.
                     _validate_redis_index(client, configured, name)
+                    _assert_no_stale_documents(client, name)
                     _assert_lock_owned(client, lock_key, token)
                     client.set(manifest_key, json.dumps(configured.to_dict()))
                     client.delete(marker_key)
@@ -751,6 +789,7 @@ def _redis_preflight(client: Any, settings: Settings) -> None:
         # Fresh: init-marker protocol makes a crash between create and manifest-write
         # recoverable (and an unmarked index is never silently adopted). Re-check lock
         # ownership before each mutation so a stale owner that lost the lock stops writing.
+        _assert_no_stale_documents(client, name)
         _assert_lock_owned(client, lock_key, token)
         client.set(
             marker_key,

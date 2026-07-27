@@ -549,6 +549,92 @@ def test_responses_incomplete_maps_to_known_exception(
         responses_chat_service.generate_response(sample_chat_input)
 
 
+def test_responses_incomplete_with_function_call_maps_to_known_exception(
+    responses_chat_service: ChatService,
+    mock_openai_client: OpenAI,
+    mock_source_service: SourceService,
+    sample_chat_input: CreateChatRequest,
+    mocker: MockerFixture,
+) -> None:
+    # A max_output_tokens-truncated response can carry a function call whose JSON
+    # arguments are cut off. Completeness must be checked BEFORE tool processing so
+    # this maps to a clean 400 (KnownException), not a JSONDecodeError -> 500.
+    truncated_call = ResponseFunctionToolCall(
+        type="function_call",
+        call_id="fc-trunc",
+        name="retrieve_documents",
+        arguments='{"source_name": "sou',  # truncated mid-JSON
+    )
+    mocker.patch.object(
+        mock_openai_client.responses,
+        "create",
+        return_value=SimpleNamespace(
+            output=[truncated_call],
+            output_text="",
+            id="r1",
+            status="incomplete",
+            incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+        ),
+    )
+    search = mocker.patch.object(mock_source_service, "search_source")
+
+    with pytest.raises(KnownException, match="incomplete: max_output_tokens"):
+        responses_chat_service.generate_response(sample_chat_input)
+    search.assert_not_called()  # the truncated tool call never reached the executor
+
+
+def test_unknown_tool_call_maps_to_known_exception(
+    responses_chat_service: ChatService,
+    mock_openai_client: OpenAI,
+    sample_chat_input: CreateChatRequest,
+    mocker: MockerFixture,
+) -> None:
+    hallucinated = ResponseFunctionToolCall(
+        type="function_call", call_id="fc-1", name="delete_all_sources", arguments="{}"
+    )
+    mocker.patch.object(
+        mock_openai_client.responses,
+        "create",
+        return_value=SimpleNamespace(
+            output=[hallucinated], output_text="", id="r1", status="completed"
+        ),
+    )
+
+    with pytest.raises(KnownException, match="unknown tool"):
+        responses_chat_service.generate_response(sample_chat_input)
+
+
+def test_malformed_tool_arguments_map_to_known_exception(
+    responses_chat_service: ChatService,
+    mock_openai_client: OpenAI,
+    sample_chat_input: CreateChatRequest,
+    mocker: MockerFixture,
+) -> None:
+    bad_args = ResponseFunctionToolCall(
+        type="function_call",
+        call_id="fc-1",
+        name="retrieve_documents",
+        arguments='{"wrong_field": true}',  # valid JSON, fails schema validation
+    )
+    mocker.patch.object(
+        mock_openai_client.responses,
+        "create",
+        return_value=SimpleNamespace(
+            output=[bad_args], output_text="", id="r1", status="completed"
+        ),
+    )
+
+    with pytest.raises(KnownException, match="invalid tool call"):
+        responses_chat_service.generate_response(sample_chat_input)
+
+
+def test_empty_messages_list_is_rejected_by_schema() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        CreateChatRequest(messages=[], model="gpt-4o", sources=["s1"])
+
+
 def test_responses_empty_output_maps_to_known_exception(
     responses_chat_service: ChatService,
     mock_openai_client: OpenAI,

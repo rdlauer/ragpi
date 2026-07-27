@@ -198,6 +198,23 @@ def test_crash_marker_with_incompatible_index_fails(redis_url: str) -> None:
         run_preflight(settings)
 
 
+def test_fresh_create_with_leftover_document_keys_fails(redis_url: str) -> None:
+    # A fresh index build must not silently re-index document hashes left over from a
+    # previous embedding configuration (RediSearch background-indexes anything under
+    # the prefix): operator dropped index+manifest but missed the keys.
+    client = create_redis_client(redis_url)
+    try:
+        client.hset(
+            f"{NS}:sources:old-source:doc1",
+            mapping={"id": "old-source:doc1", "content": "stale"},
+        )
+    finally:
+        client.close()
+
+    with pytest.raises(PreflightError, match="leftover document keys"):
+        run_preflight(_settings(redis_url))
+
+
 def test_recovers_after_abandoned_lock_expires(redis_url: str) -> None:
     from src.document_store.preflight import _redis_lock
 

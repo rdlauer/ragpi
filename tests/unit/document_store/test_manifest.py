@@ -63,6 +63,18 @@ class TestNormalizeEndpointOrigin:
     def test_bare_host_without_scheme(self):
         assert normalize_endpoint_origin("Ollama-Host") == "ollama-host"
 
+    def test_schemeless_host_port_keeps_the_port(self):
+        # urlsplit would misparse "myhost:11434" as scheme "myhost" and drop the port,
+        # collapsing distinct endpoints into one space identity.
+        assert normalize_endpoint_origin("myhost:11434") == "myhost:11434"
+        assert normalize_endpoint_origin("MyHost:11434") == "myhost:11434"
+        assert normalize_endpoint_origin("myhost:11434") != normalize_endpoint_origin(
+            "myhost:11435"
+        )
+
+    def test_schemeless_credentials_are_stripped(self):
+        assert normalize_endpoint_origin("user:secret@MyHost:11434") == "myhost:11434"
+
 
 class TestManifestRoundTrip:
     def test_to_from_dict_roundtrip(self):

@@ -47,6 +47,16 @@ def test_reasoning_effort_on_responses_error_does_not_advise_enabling() -> None:
     assert "CHAT_USE_RESPONSES_API" not in str(exc.value)
 
 
+def test_responses_only_model_phrasing_advises_enabling_responses() -> None:
+    # OpenAI's phrasing for Responses-only models on the chat path.
+    err = _api_error(
+        "This model is only supported in v1/responses and not in v1/chat/completions.",
+        type="invalid_request_error",
+    )
+    with pytest.raises(KnownException, match="CHAT_USE_RESPONSES_API"):
+        handle_openai_client_error(err, "gpt-5.6-sol")
+
+
 def test_model_not_found_still_maps_to_resource_not_found() -> None:
     err = _api_error("Model not found", code="model_not_found", param="model", type="not_found")
     with pytest.raises(ResourceNotFoundException) as exc:
