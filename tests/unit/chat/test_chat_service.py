@@ -628,6 +628,82 @@ def test_malformed_tool_arguments_map_to_known_exception(
         responses_chat_service.generate_response(sample_chat_input)
 
 
+def test_nonexistent_source_in_tool_call_feeds_error_back_to_model(
+    chat_service: ChatService,
+    mock_openai_client: OpenAI,
+    mock_source_service: SourceService,
+    sample_chat_input: CreateChatRequest,
+    mocker: MockerFixture,
+) -> None:
+    # The model may hallucinate a source name (e.g. one mentioned in prompt prose but
+    # not registered). The error must be returned AS the tool result so the model can
+    # self-correct — not propagate as a 404 for the whole chat request.
+    bad_source_completion = ChatCompletion(
+        id="c1",
+        choices=[
+            Choice(
+                finish_reason="tool_calls",
+                index=0,
+                message=ChatCompletionMessage(
+                    content=None,
+                    role="assistant",
+                    tool_calls=[
+                        ChatCompletionMessageToolCall(
+                            id="call-1",
+                            type="function",
+                            function=Function(
+                                name="retrieve_documents",
+                                arguments='{"source_name": "no-such-source", '
+                                '"semantic_query": "q", "full_text_query": "q"}',
+                            ),
+                        )
+                    ],
+                ),
+            )
+        ],
+        created=1,
+        model="gpt-4o",
+        object="chat.completion",
+    )
+    final_completion = ChatCompletion(
+        id="c2",
+        choices=[
+            Choice(
+                finish_reason="stop",
+                index=0,
+                message=ChatCompletionMessage(content="answer", role="assistant"),
+            )
+        ],
+        created=1,
+        model="gpt-4o",
+        object="chat.completion",
+    )
+    create = mocker.patch.object(
+        mock_openai_client.chat.completions,
+        "create",
+        side_effect=[bad_source_completion, final_completion],
+    )
+    mocker.patch.object(
+        mock_source_service,
+        "search_source",
+        side_effect=ResourceNotFoundException(ResourceType.SOURCE, "no-such-source"),
+    )
+    mocker.patch.object(
+        mock_source_service,
+        "list_sources",
+        return_value=[SimpleNamespace(name="real-source", description="d")],
+    )
+
+    response = chat_service.generate_response(sample_chat_input)
+
+    assert response.message == "answer"
+    # The second call's messages include the error tool-result with the valid options.
+    second_messages = create.call_args_list[1].kwargs["messages"]
+    tool_msgs = [m for m in second_messages if isinstance(m, dict) and m.get("role") == "tool"]
+    assert tool_msgs and "does not exist" in tool_msgs[-1]["content"]
+    assert "real-source" in tool_msgs[-1]["content"]
+
+
 def test_empty_messages_list_is_rejected_by_schema() -> None:
     from pydantic import ValidationError
 

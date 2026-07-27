@@ -18,7 +18,7 @@ from src.chat.prompts import get_system_prompt
 from src.chat.schemas import ChatResponse, CreateChatRequest
 from src.chat.tools.definitions import ToolDefinition
 from src.chat.tools.schamas import RetrieveDocuments
-from src.common.exceptions import KnownException
+from src.common.exceptions import KnownException, ResourceNotFoundException
 from src.llm_providers.exceptions import handle_openai_client_error
 from src.sources.metadata.schemas import SourceMetadata
 from src.sources.service import SourceService
@@ -119,12 +119,25 @@ class ChatService:
             raise ChatException(
                 "The model produced an invalid tool call; please retry the request."
             ) from e
-        documents = self.source_service.search_source(
-            source_name=source_input.source_name,
-            semantic_query=source_input.semantic_query,
-            full_text_query=source_input.full_text_query,
-            top_k=self.retrieval_top_k,
-        )
+        try:
+            documents = self.source_service.search_source(
+                source_name=source_input.source_name,
+                semantic_query=source_input.semantic_query,
+                full_text_query=source_input.full_text_query,
+                top_k=self.retrieval_top_k,
+            )
+        except ResourceNotFoundException:
+            # The model asked for a source that doesn't exist (e.g. one referenced in
+            # prompt prose but not registered). Return the error AS the tool result so
+            # the model can self-correct within its iteration budget, instead of the
+            # whole chat request failing with a confusing 404.
+            available = [source.name for source in self.source_service.list_sources()]
+            return json.dumps(
+                {
+                    "error": f"Source '{source_input.source_name}' does not exist.",
+                    "available_sources": available,
+                }
+            )
         return json.dumps(
             [{"url": doc.url, "content": doc.content} for doc in documents]
         )
