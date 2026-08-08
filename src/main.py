@@ -26,6 +26,7 @@ from src.common.opentelemetry import setup_opentelemetry
 from src.common.postgres import dispose_postgres_engine
 from src.common.redis import create_redis_client
 from src.config import get_settings
+from src.document_store.preflight import run_preflight
 from src.sources.router import router as source_router
 from src.chat.router import router as chat_router
 from src.tasks.router import router as tasks_router
@@ -43,6 +44,10 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Validate/prepare the document store once, before serving. A misconfiguration
+    # (incompatible manifest, too-old pgvector, unverifiable legacy store) raises
+    # and aborts startup rather than surfacing as a per-request error.
+    run_preflight(settings)
     app.state.redis_client = create_redis_client(settings.REDIS_URL)
     app.state.celery_app = celery_app
     yield

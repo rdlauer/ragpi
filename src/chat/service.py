@@ -1,5 +1,8 @@
+import copy
 import json
+from typing import Any
 from openai import APIError, OpenAI, pydantic_function_tool
+from pydantic import ValidationError
 from openai.types.chat import (
     ChatCompletionMessageParam,
     ChatCompletionSystemMessageParam,
@@ -8,13 +11,14 @@ from openai.types.chat import (
     ChatCompletionToolMessageParam,
     ChatCompletionMessageToolCall,
 )
+from openai.types.responses import ResponseFunctionToolCall
 
 from src.chat.exceptions import ChatException
 from src.chat.prompts import get_system_prompt
 from src.chat.schemas import ChatResponse, CreateChatRequest
 from src.chat.tools.definitions import ToolDefinition
 from src.chat.tools.schamas import RetrieveDocuments
-from src.common.exceptions import KnownException
+from src.common.exceptions import KnownException, ResourceNotFoundException
 from src.llm_providers.exceptions import handle_openai_client_error
 from src.sources.metadata.schemas import SourceMetadata
 from src.sources.service import SourceService
@@ -33,6 +37,9 @@ class ChatService:
         chat_history_limit: int,
         max_iterations: int,
         retrieval_top_k: int,
+        use_responses_api: bool = False,
+        reasoning_effort: str | None = None,
+        responses_store: bool = True,
     ):
         self.chat_client = openai_client
         self.source_service = source_service
@@ -42,6 +49,9 @@ class ChatService:
         self.chat_history_limit = chat_history_limit
         self.max_iterations = max_iterations
         self.retrieval_top_k = retrieval_top_k
+        self.use_responses_api = use_responses_api
+        self.reasoning_effort = reasoning_effort
+        self.responses_store = responses_store
         self.tools = [
             pydantic_function_tool(
                 model=tool.model,
@@ -50,6 +60,22 @@ class ChatService:
             )
             for tool in tool_definitions
         ]
+        # Flat Responses-API tool schema, deep-copied from the chat-completions tools
+        # so flattening can never mutate the (nested) chat schema.
+        self.responses_tools: list[dict[str, Any]] = [
+            self._to_responses_tool(tool) for tool in self.tools
+        ]
+
+    @staticmethod
+    def _to_responses_tool(chat_tool: Any) -> dict[str, Any]:
+        fn = copy.deepcopy(dict(chat_tool)["function"])
+        return {
+            "type": "function",
+            "name": fn["name"],
+            "description": fn.get("description"),
+            "parameters": fn.get("parameters"),
+            "strict": fn.get("strict", True),
+        }
 
     def _get_sources(
         self, source_names: list[str] | None = None
@@ -78,27 +104,52 @@ class ChatService:
             ChatCompletionUserMessageParam(role="user", content=user_message),
         ]
 
+    def _retrieve_documents(self, name: str, arguments: str) -> str:
+        """Run the retrieve_documents tool and return its JSON result. Shared by the
+        Chat Completions and Responses tool-call loops (only the surrounding message
+        shapes differ). A hallucinated tool name or malformed/invalid arguments are
+        degenerate model output, mapped to ChatException (clean 400), not a 500."""
+        if name != "retrieve_documents":
+            raise ChatException(f"The model called an unknown tool: {name}")
+
+        try:
+            args = json.loads(arguments)
+            source_input = RetrieveDocuments(**args)
+        except (json.JSONDecodeError, ValidationError, TypeError) as e:
+            raise ChatException(
+                "The model produced an invalid tool call; please retry the request."
+            ) from e
+        try:
+            documents = self.source_service.search_source(
+                source_name=source_input.source_name,
+                semantic_query=source_input.semantic_query,
+                full_text_query=source_input.full_text_query,
+                top_k=self.retrieval_top_k,
+            )
+        except ResourceNotFoundException:
+            # The model asked for a source that doesn't exist (e.g. one referenced in
+            # prompt prose but not registered). Return the error AS the tool result so
+            # the model can self-correct within its iteration budget, instead of the
+            # whole chat request failing with a confusing 404.
+            available = [source.name for source in self.source_service.list_sources()]
+            return json.dumps(
+                {
+                    "error": f"Source '{source_input.source_name}' does not exist.",
+                    "available_sources": available,
+                }
+            )
+        return json.dumps(
+            [{"url": doc.url, "content": doc.content} for doc in documents]
+        )
+
     def _handle_tool_call(
         self,
         tool_call: ChatCompletionMessageToolCall,
     ) -> ChatCompletionToolMessageParam:
-        """Handle a tool call and append the result to messages."""
-        if tool_call.function.name != "retrieve_documents":
-            raise ValueError(f"Unknown tool call: {tool_call.function.name}")
-
-        args = json.loads(tool_call.function.arguments)
-        source_input = RetrieveDocuments(**args)
-        documents = self.source_service.search_source(
-            source_name=source_input.source_name,
-            semantic_query=source_input.semantic_query,
-            full_text_query=source_input.full_text_query,
-            top_k=self.retrieval_top_k,
+        """Handle a Chat Completions tool call."""
+        content = self._retrieve_documents(
+            tool_call.function.name, tool_call.function.arguments
         )
-
-        content = json.dumps(
-            [{"url": doc.url, "content": doc.content} for doc in documents]
-        )
-
         return ChatCompletionToolMessageParam(
             tool_call_id=tool_call.id,
             content=content,
@@ -106,9 +157,10 @@ class ChatService:
         )
 
     def generate_response(self, chat_input: CreateChatRequest) -> ChatResponse:
-        """Generate a response based on chat input."""
+        """Generate a response based on chat input, dispatching to the opt-in
+        Responses API path (OpenAI reasoning models) or the default Chat Completions
+        path used by every other provider/model."""
         try:
-            # Initialize chat context
             sources = self._get_sources(chat_input.sources)
             system_prompt = get_system_prompt(
                 project_name=self.project_name,
@@ -118,50 +170,145 @@ class ChatService:
                 max_attempts=self.max_iterations,
             )
 
-            # Prepare chat history
-            chat_history: list[ChatCompletionMessageParam] = [
-                (
-                    ChatCompletionUserMessageParam(role="user", content=msg.content)
-                    if msg.role == "user"
-                    else ChatCompletionAssistantMessageParam(
-                        role="assistant", content=msg.content
-                    )
-                )
-                for msg in chat_input.messages[-self.chat_history_limit : -1]
-            ]
-
-            messages = self._create_chat_messages(
-                system_prompt, chat_history, chat_input.messages[-1].content
-            )
-
-            # Generate response
-            for _ in range(self.max_iterations):
-                response = self.chat_client.chat.completions.create(
-                    model=chat_input.model,
-                    messages=messages,
-                    tools=self.tools,
-                )
-
-                message = response.choices[0].message
-                messages.append(message)  # type: ignore
-
-                if message.tool_calls:
-                    for tool_call in message.tool_calls:
-                        tool_response = self._handle_tool_call(tool_call)  # type: ignore
-                        messages.append(tool_response)
-                elif message.content:
-                    return ChatResponse(message=message.content)
-                else:
-                    raise ValueError(
-                        "No response content or tool call found in completion."
-                    )
-
-            return ChatResponse(
-                message="I'm sorry, but I don't have the information you're looking for."
-            )
+            if self.use_responses_api:
+                return self._generate_via_responses(chat_input, system_prompt)
+            return self._generate_via_chat_completions(chat_input, system_prompt)
 
         except ChatException as e:
             raise KnownException(str(e))
         except APIError as e:
             handle_openai_client_error(e, chat_input.model)
             raise e
+
+    def _generate_via_chat_completions(
+        self, chat_input: CreateChatRequest, system_prompt: str
+    ) -> ChatResponse:
+        # Prepare chat history
+        chat_history: list[ChatCompletionMessageParam] = [
+            (
+                ChatCompletionUserMessageParam(role="user", content=msg.content)
+                if msg.role == "user"
+                else ChatCompletionAssistantMessageParam(
+                    role="assistant", content=msg.content
+                )
+            )
+            for msg in chat_input.messages[-self.chat_history_limit : -1]
+        ]
+
+        messages = self._create_chat_messages(
+            system_prompt, chat_history, chat_input.messages[-1].content
+        )
+
+        # Generate response
+        for _ in range(self.max_iterations):
+            response = self.chat_client.chat.completions.create(
+                model=chat_input.model,
+                messages=messages,
+                tools=self.tools,
+            )
+
+            message = response.choices[0].message
+            messages.append(message)  # type: ignore
+
+            if message.tool_calls:
+                for tool_call in message.tool_calls:
+                    tool_response = self._handle_tool_call(tool_call)  # type: ignore
+                    messages.append(tool_response)
+            elif message.content:
+                return ChatResponse(message=message.content)
+            else:
+                # ChatException (not a raw error) so this maps to a clean 400, not a 500.
+                raise ChatException(
+                    "The model returned no content or tool call."
+                )
+
+        return ChatResponse(
+            message="I'm sorry, but I don't have the information you're looking for."
+        )
+
+    def _generate_via_responses(
+        self, chat_input: CreateChatRequest, system_prompt: str
+    ) -> ChatResponse:
+        """Reasoning + tools via the OpenAI Responses API. Reasoning continuity is
+        preserved across the internal tool-call loop (previous_response_id) within
+        this single request; conversation history is passed as input items."""
+        effort = chat_input.reasoning_effort or self.reasoning_effort
+
+        input_items: list[dict[str, Any]] = [
+            {"role": msg.role, "content": msg.content}
+            for msg in chat_input.messages[-self.chat_history_limit : -1]
+        ]
+        input_items.append(
+            {"role": "user", "content": chat_input.messages[-1].content}
+        )
+
+        kwargs: dict[str, Any] = {}
+        if self.responses_tools:
+            kwargs["tools"] = self.responses_tools
+        if effort:
+            kwargs["reasoning"] = {"effort": effort}
+
+        previous_response_id: str | None = None
+        for _ in range(self.max_iterations):
+            response = self.chat_client.responses.create(
+                model=chat_input.model,
+                instructions=system_prompt,
+                input=input_items,  # type: ignore[arg-type]
+                store=self.responses_store,
+                previous_response_id=previous_response_id,
+                **kwargs,
+            )
+
+            # Check completeness BEFORE processing tool calls: an incomplete response
+            # (e.g. max_output_tokens) can carry a function call with truncated JSON
+            # arguments, which must not reach the tool executor.
+            if getattr(response, "status", None) == "incomplete":
+                details = getattr(response, "incomplete_details", None)
+                reason = getattr(details, "reason", None) or "unknown"
+                raise ChatException(
+                    f"The model could not complete the response (incomplete: {reason})."
+                )
+
+            function_calls = [
+                item
+                for item in response.output
+                if isinstance(item, ResponseFunctionToolCall)
+            ]
+
+            if function_calls:
+                previous_response_id = response.id
+                input_items = []
+                for call in function_calls:
+                    output = self._retrieve_documents(call.name, call.arguments)
+                    input_items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": call.call_id,
+                            "output": output,
+                        }
+                    )
+                continue
+
+            # No tool calls: a normal answer, a safeguard refusal, an incomplete
+            # response (e.g. token exhaustion), or genuinely empty output. Map the
+            # non-answer cases to ChatException (clean 400) rather than a raw 500.
+            if response.output_text:
+                return ChatResponse(message=response.output_text)
+            refusal = self._extract_refusal(response)
+            if refusal:
+                return ChatResponse(message=refusal)
+            raise ChatException("The model returned no answer content.")
+
+        return ChatResponse(
+            message="I'm sorry, but I don't have the information you're looking for."
+        )
+
+    @staticmethod
+    def _extract_refusal(response: Any) -> str | None:
+        """Return the refusal text if the model declined the request, else None."""
+        for item in response.output:
+            if getattr(item, "type", None) == "message":
+                for block in getattr(item, "content", None) or []:
+                    if getattr(block, "type", None) == "refusal":
+                        return getattr(block, "refusal", None)
+        return None

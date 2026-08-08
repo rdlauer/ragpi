@@ -19,6 +19,8 @@ def get_document_store_backend(
             openai_client=openai_client,
             embedding_model=settings.EMBEDDING_MODEL,
             embedding_dimensions=settings.EMBEDDING_DIMENSIONS,
+            candidate_multiplier=settings.EMBEDDING_CANDIDATE_MULTIPLIER,
+            hnsw_ef_search=settings.HNSW_EF_SEARCH,
         )
     elif settings.DOCUMENT_STORE_BACKEND == "redis":
         return RedisDocumentStore(

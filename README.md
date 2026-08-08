@@ -77,6 +77,100 @@ Ragpi supports the following LLM providers for generating responses and embeddin
 
 [Configure providers →](https://docs.ragpi.io/providers/overview)
 
+## Model & Embedding Configuration
+
+### Reasoning models (OpenAI Responses API)
+
+Modern OpenAI reasoning models (e.g. `gpt-5.6-sol`, `gpt-5.6-terra`) can use function
+tools together with active reasoning via the Responses API. This path is **opt-in** and
+only available when `CHAT_PROVIDER=openai`:
+
+```bash
+CHAT_PROVIDER=openai
+DEFAULT_CHAT_MODEL=gpt-5.6-sol
+CHAT_USE_RESPONSES_API=true
+REASONING_EFFORT=medium        # gpt-5.6: none|low|medium|high|xhigh|max (optional)
+```
+
+When `CHAT_USE_RESPONSES_API` is off (the default), all providers use the Chat Completions
+API exactly as before. `reasoning_effort` may also be set per request. Reasoning continuity
+is preserved across the tool-call loop within a single `/chat` request.
+
+> **Privacy:** the Responses path sends `store=true`, i.e. conversation state is retained in
+> OpenAI's stored Responses workflow (used for reasoning continuity across tool calls).
+> Zero-Data-Retention (`store=false`) is not yet supported.
+
+### Embedding model & dimensions
+
+The embedding model and dimensionality are configured with `EMBEDDING_MODEL` and
+`EMBEDDING_DIMENSIONS`. `text-embedding-3-large` is supported at its full 3072 dimensions:
+
+```bash
+EMBEDDING_MODEL=text-embedding-3-large
+EMBEDDING_DIMENSIONS=3072
+```
+
+On Postgres, embeddings are always stored as full-precision float32. Above 2000 dimensions
+(pgvector's approximate-index limit for the `vector` type) Ragpi builds a half-precision
+(`halfvec`) HNSW expression index and queries in two stages — approximate candidates, then
+an exact float32 rerank. This requires the **pgvector server extension ≥ 0.8.2** (0.8.2
+fixed a buffer overflow in parallel HNSW index builds); the bundled
+`pgvector/pgvector:pg17` image satisfies it. Redis needs no change.
+
+Note that Postgres chooses the access path per query: for small and medium sources it
+typically serves the candidate stage with an **exact scan** of the filtered source (which
+is both fast and perfectly accurate at that scale — measured ~25 ms/query even for a
+50k-document source) and switches to the HNSW index only when a source grows large enough
+for it to win on cost.
+Retrieval over-fetch is tunable via `EMBEDDING_CANDIDATE_MULTIPLIER` (default 10) and
+`HNSW_EF_SEARCH`; these only affect queries served by the index.
+
+Ragpi records a manifest for each store (embedding provider/model/dimensions, storage and
+index schema). At startup it validates the configured settings against the manifest and
+**fails fast with actionable guidance** on an incompatible change (rather than a cryptic
+insert error) — note that a model change requires re-embedding even at the same dimensions.
+
+#### Changing the embedding model / dimensions
+
+Changing the embedding identity (provider, model, or dimensions) requires re-embedding all
+documents. There is no automatic data migration. Do **not** use `docker compose down -v`
+(it deletes more than embeddings). Instead:
+
+1. Back up the database / Redis data.
+2. Stop the API and workers.
+3. Remove the document vectors **and** the store manifest, keeping source metadata:
+   - **Postgres:** `DROP TABLE <DOCUMENT_STORE_NAMESPACE>;` and delete its row from
+     `ragpi_store_manifest` (leave the `source_metadata` table intact).
+   - **Redis:** drop the index, delete its `<namespace>:sources:*` keys, and delete the
+     `<namespace>:__manifest__` key.
+4. Restart with the new `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` (preflight recreates the
+   schema/index and writes a new manifest).
+5. Re-sync every source (connectors re-fetch and re-embed).
+6. Verify document counts and semantic-search results.
+
+#### Changing the vector index (without re-embedding)
+
+If only the index definition changes (algorithm, opclass, or build params like `lists` /
+`m` / `ef_construction`) — not the embedding model or dimensions — the stored vectors are
+still valid, so you can rebuild just the index:
+
+1. Stop the API and workers.
+2. Rebuild the vector index to the new definition (drop the old index, `CREATE` the new one
+   with the new parameters). Stored vectors are untouched.
+3. Reset the manifest so preflight re-derives it from the new physical index:
+   - **Postgres:** `DELETE FROM ragpi_store_manifest WHERE namespace = '<DOCUMENT_STORE_NAMESPACE>';`
+   - **Redis:** `DEL <namespace>:__manifest__`
+4. Restart. Preflight adopts the existing store, validates that the physical index exactly
+   matches the configured definition, and writes the updated manifest — no re-embedding. If
+   the embedding model is not the legacy default, set `EMBEDDING_ADOPT_EXISTING=true` for the
+   restart.
+
+If a persistent store is left un-migrated after a dimension/model change, startup fails with
+guidance rather than corrupting data. For an existing pre-0.8.2 pgvector extension on the
+large path, set `PG_UPDATE_VECTOR_EXTENSION=true` to run `ALTER EXTENSION vector UPDATE` at
+startup — note this upgrades the extension for the **entire** database, so back up and
+revalidate other pgvector-dependent applications first.
+
 ## Integrations
 
 Ragpi supports the following integrations for interacting with the AI assistant:
